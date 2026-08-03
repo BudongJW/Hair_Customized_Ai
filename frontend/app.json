@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "name": "Hair Fit Studio",
+    "slug": "hair-customized-ai",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "plugins": [
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "헤어 피팅에 사용할 사진을 선택합니다.",
+          "cameraPermission": "헤어 피팅에 사용할 사진을 촬영합니다."
+        }
+      ]
+    ]
+  }
+}

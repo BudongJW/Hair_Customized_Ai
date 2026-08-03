@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: hair-customized-ai-postgres
+    environment:
+      POSTGRES_DB: hair_customized_ai
+      POSTGRES_USER: postgresql
+      POSTGRES_PASSWORD: qowngus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7
+    container_name: hair-customized-ai-redis
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres-data:
