@@ -51,6 +51,9 @@ JAW_LEFT_INDEX = 172
 JAW_RIGHT_INDEX = 397
 # Neck half-width relative to half the distance between the jaw angles.
 NECK_WIDTH_SCALE = 0.80
+# How much of the seam colour offset reaches the middle of the synthetic scalp.
+SEAM_FAR_WEIGHT = 0.35
+SEAM_FAR_LIMIT = 15.0
 
 # Skull model, expressed in face units (see _estimate_skull):
 #   width  = face-oval width * SKULL_WIDTH_SCALE
@@ -208,6 +211,9 @@ def remove_hair(
         skin_probability = _fallback_skin_probability(points, (width, height))
     dome = _render_scalp(rgb, skull, local_grid, skin_probability, removal, protection, points, frame, unit)
     dome = _harmonize_seam(dome, rgb, removal, protection, skin_probability, segmentation.body_skin, unit)
+    dome, forehead_gain = _anchor_scalp_tone(
+        dome, rgb, removal, scalp_region, protection, skin_probability, frame, points, local_grid, unit
+    )
 
     brows_redrawn: list[str] = []
     if redraw_hidden_eyebrows:
@@ -242,6 +248,7 @@ def remove_hair(
         "scalpFillPixelCount": int(scalp_region.sum()),
         "backgroundFillPixelCount": int(background_region.sum()),
         "rebuiltNeckPixelCount": neck_pixels,
+        "scalpToneGain": forehead_gain,
         "redrawnEyebrows": brows_redrawn,
     }
     return HairRemovalResult(
@@ -652,6 +659,42 @@ def _skin_grain(rgb: np.ndarray, skin_samples: np.ndarray, unit: float) -> np.nd
     return noise * strength * 0.7
 
 
+def _anchor_scalp_tone(
+    dome: np.ndarray,
+    rgb: np.ndarray,
+    removal: np.ndarray,
+    scalp_region: np.ndarray,
+    protection: np.ndarray,
+    skin_probability: np.ndarray,
+    frame: _FaceFrame,
+    points: np.ndarray,
+    local_grid: np.ndarray,
+    unit: float,
+) -> tuple[np.ndarray, list[float] | None]:
+    """Pull the middle of the synthetic scalp/forehead to the colour of the user's real
+    upper-face skin (between the eyes and the nose tip).
+
+    Compared with full-image generators (e.g. HairFastGAN), the drawn forehead under a new
+    hairline read as a grey, darker patch. Seams keep their exact match; the correction
+    fades in away from them.
+    """
+
+    local = frame.to_local(points)
+    eye_v = float(local[LEFT_EYE_INDICES + RIGHT_EYE_INDICES, 1].max())
+    nose_v = float(local[NOSE_TIP_INDEX, 1])
+    v = local_grid[..., 1]
+    reference = (skin_probability > 0.8) & ~removal & ~protection & (v > eye_v) & (v < nose_v)
+    forehead = scalp_region & (v > float(local[FOREHEAD_TOP_INDEX, 1]) - 0.15 * unit)
+    if reference.sum() < 200 or forehead.sum() < 200:
+        return dome, None
+
+    gain = np.clip(np.median(rgb[reference], axis=0) / np.maximum(np.median(dome[forehead], axis=0), 1.0), 0.9, 1.2)
+    seam = _dilate(removal, radius=max(2.0, unit * 0.012)) & ~removal & ~protection & (skin_probability > 0.6)
+    weight = (1.0 - _proximity(seam, unit * 0.05)) if seam.any() else np.ones(removal.shape, dtype=np.float32)
+    weight = np.clip(weight, 0.0, 1.0)[..., None]
+    return dome * (1.0 + (gain - 1.0) * weight), [round(float(g), 3) for g in gain]
+
+
 def _harmonize_seam(
     dome: np.ndarray,
     rgb: np.ndarray,
@@ -687,8 +730,11 @@ def _harmonize_seam(
     difference = np.clip(rgb - dome, -110.0, 60.0)
     smoothed = _blur(difference * seam[..., None], band) / np.maximum(_blur(seam.astype(np.float32), band), 1e-4)[..., None]
     correction = _push_pull(smoothed, seam.astype(np.float32))
-    # The seam itself must match exactly; away from it only the low-frequency part matters.
-    far = _blur(correction, unit * 0.06)
+    # The seam itself must match exactly. Away from it, skin along the seam is usually in
+    # the old hair's shadow, so only a small, bounded part of that offset is carried into
+    # the interior; otherwise the whole scalp (and the forehead under a new hairline)
+    # turns greyer and darker than the face.
+    far = np.clip(_blur(correction, unit * 0.06), -SEAM_FAR_LIMIT, SEAM_FAR_LIMIT) * SEAM_FAR_WEIGHT
     near = _proximity(seam, unit * 0.05)[..., None]
     return dome + correction * near + far * (1.0 - near)
 

@@ -16,6 +16,7 @@ AI_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AI_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from app import hair_alignment as ha  # noqa: E402
 from app.hair_alignment import _tps_map, transfer_hair  # noqa: E402
 from app.hair_removal import FACE_OVAL_INDICES, LEFT_EYE_INDICES, HeadSegmentation, push_pull_inpaint  # noqa: E402
 from test_hair_removal import BACKGROUND, SKIN, _synthetic_portrait  # noqa: E402
@@ -173,6 +174,33 @@ class LendingTest(unittest.TestCase):
     def test_forehead_skin_texture_is_lent(self):
         self.assertGreater(self.result.metadata["lentSkinTexturePixelCount"], 0)
         self.assertTrue(np.isfinite(np.asarray(self.result.image, dtype=np.float32)).all())
+
+
+class SkinTextureEdgeTest(unittest.TestCase):
+    def test_no_dark_rim_where_the_hair_model_shows_no_skin(self):
+        # Regression: the feathered weight reached pixels with no sampled skin, where the
+        # texture factor came out as 0 and painted a dark rim along the hairline.
+        image, landmarks, _segmentation, points, _hair = _synthetic_portrait()
+        width, height = image.size
+        ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+        warp = ha._Warp(source_x=xs, source_y=ys, info={})
+        valid = np.zeros((height, width), dtype=np.float32)
+        valid[:, : width // 2] = 1.0
+        layer = ha.HairLayer(
+            rgb=np.zeros((height, width, 3), dtype=np.float32),
+            alpha=np.zeros((height, width), dtype=np.float32),
+            points=points,
+            skull=None,
+            skin_luminance=None,
+            skin_texture=valid.copy(),  # a flat texture factor of 1 where valid
+            skin_texture_valid=valid,
+        )
+        frame = ha._face_frame(points)
+        canvas = np.full((height, width, 3), 200.0, dtype=np.float32)
+        lent, _count = ha._lend_skin_texture(
+            canvas, layer, warp, np.ones((height, width), dtype=bool), frame, points, ha._local_grid(frame, width, height), 400.0
+        )
+        self.assertGreater(float(lent.min()), 199.0)
 
 
 class ThinPlateSplineTest(unittest.TestCase):

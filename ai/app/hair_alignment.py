@@ -167,6 +167,7 @@ def transfer_hair(
     canvas, ear_pixels = _lend_ears(
         canvas, layer, warp, removal, target_skin_color, target_frame, target_points, target_grid, target_skull.face_width
     )
+    warped_alpha = _fade_hairline(warped_alpha, scalp_fill, target_skull.face_width)
     exposure = _exposure_match(layer, canvas, target_points, target_segmentation)
     hair_rgb = np.clip(warped_rgb * exposure, 0.0, 255.0)
     canvas, back_hair_pixels = _fill_back_hair(canvas, hair_rgb, warped_alpha, target_skull, target_segmentation)
@@ -405,6 +406,18 @@ def _exposure_match(
     return float(np.clip(np.sqrt(ratio), 0.8, 1.25))
 
 
+def _fade_hairline(alpha: np.ndarray, scalp_fill: np.ndarray, unit: float) -> np.ndarray:
+    """Where the new hair ends on the drawn forehead, thin it out over a few millimetres
+    instead of ending on a cut-out edge (full-image generators get this for free)."""
+
+    if not scalp_fill.any():
+        return alpha
+    near_forehead = _dilate(scalp_fill & (alpha < 0.5), radius=0.03 * unit)
+    softened = np.minimum(alpha, _blur(alpha, max(1.0, 0.012 * unit)))
+    weight = np.clip(_blur(near_forehead.astype(np.float32), max(1.0, 0.01 * unit)), 0.0, 1.0)
+    return alpha * (1.0 - weight) + softened * weight
+
+
 def _skin_color(rgb: np.ndarray, segmentation: HeadSegmentation, exclude: np.ndarray) -> np.ndarray | None:
     if segmentation.face_skin is None:
         return None
@@ -438,7 +451,7 @@ def _skin_texture(
 
     luminance = _luminance(rgb)
     smooth = _masked_mean(luminance, valid, max(1.0, 0.006 * unit))
-    texture = 1.0 + np.clip((luminance - smooth) / np.maximum(smooth, 1.0), -0.08, 0.08)
+    texture = 1.0 + 0.7 * np.clip((luminance - smooth) / np.maximum(smooth, 1.0), -0.06, 0.06)
     return texture * valid, valid
 
 
@@ -459,14 +472,15 @@ def _lend_skin_texture(
     if layer.skin_texture is None or not scalp_fill.any():
         return canvas, 0
     valid = warp.sample(layer.skin_texture_valid)
-    texture = warp.sample(layer.skin_texture) / np.maximum(valid, 1e-3)
+    # Where no hair-model skin was sampled the factor must stay neutral (1), not 0.
+    texture = np.where(valid > 1e-3, warp.sample(layer.skin_texture) / np.maximum(valid, 1e-3), 1.0)
 
     local = frame.to_local(points)
     brow_top_v = float(min(local[LEFT_BROW_INDICES, 1].min(), local[RIGHT_BROW_INDICES, 1].min()))
     above_brows = np.clip((brow_top_v - 0.015 * unit - grid[..., 1]) / (0.03 * unit), 0.0, 1.0)
     weight = (
         np.clip(_blur(scalp_fill.astype(np.float32), max(1.0, 0.01 * unit)), 0.0, 1.0)
-        * np.clip((valid - 0.5) * 2.0, 0.0, 1.0)
+        * np.clip(_blur(np.clip((valid - 0.5) * 2.0, 0.0, 1.0), max(1.0, 0.02 * unit)), 0.0, 1.0)
         * above_brows
     )
     if weight.max() <= 0.0:
@@ -582,7 +596,9 @@ def _composite(canvas: np.ndarray, hair_rgb: np.ndarray, alpha: np.ndarray, unit
     shifted = np.zeros_like(shadow)
     offset = max(1, int(unit * 0.01))
     shifted[offset:] = shadow[:-offset]
-    darken = 1.0 - 0.22 * np.clip(shifted - alpha, 0.0, 1.0)
+    # Compare blurred with blurred: against the sharp alpha, a softened hairline would get a
+    # dark rim right under its semi-transparent edge.
+    darken = 1.0 - 0.45 * np.clip(shifted - shadow, 0.0, 1.0)
     shaded = canvas * darken[..., None]
     return shaded * (1.0 - alpha[..., None]) + hair_rgb * alpha[..., None]
 
