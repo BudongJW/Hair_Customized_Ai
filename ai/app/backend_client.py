@@ -21,6 +21,9 @@ class BackendClient:
     def get_fitting_job(self, job_id: str) -> dict:
         return self._get(f"/api/v1/fitting-jobs/{job_id}")
 
+    def get_hair_design(self, hair_design_id: str) -> dict:
+        return self._get(f"/api/v1/hair-designs/{hair_design_id}")
+
     def update_fitting_job(self, job_id: str, payload: dict) -> dict:
         return self._patch(f"/api/v1/fitting-jobs/{job_id}/ai-result", payload)
 

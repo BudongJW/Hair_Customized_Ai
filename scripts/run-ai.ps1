@@ -7,8 +7,10 @@ $python = Join-Path $aiDir ".venv\Scripts\python.exe"
 $requirements = Join-Path $aiDir "requirements.txt"
 $depsStamp = Join-Path $aiDir ".venv\.requirements-installed"
 $modelDir = Join-Path $aiDir "models"
-$modelPath = Join-Path $modelDir "face_landmarker.task"
-$modelUrl = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+$faceLandmarkerModelPath = Join-Path $modelDir "face_landmarker.task"
+$faceLandmarkerModelUrl = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+$hairSegmenterModelPath = Join-Path $modelDir "hair_segmenter.tflite"
+$hairSegmenterModelUrl = "https://storage.googleapis.com/mediapipe-models/image_segmenter/hair_segmenter/float32/latest/hair_segmenter.tflite"
 
 Set-Location $aiDir
 $env:MPLCONFIGDIR = Join-Path $aiDir ".cache\matplotlib"
@@ -30,14 +32,24 @@ if ($shouldInstall) {
     New-Item -ItemType File -Path $depsStamp -Force | Out-Null
 }
 
-if (-not (Test-Path -LiteralPath $modelPath)) {
+if (-not (Test-Path -LiteralPath $faceLandmarkerModelPath)) {
     Write-Host "Downloading MediaPipe Face Landmarker model..." -ForegroundColor Yellow
     New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
-    Invoke-WebRequest -Uri $modelUrl -OutFile $modelPath
+    Invoke-WebRequest -Uri $faceLandmarkerModelUrl -OutFile $faceLandmarkerModelPath
+}
+
+if (-not (Test-Path -LiteralPath $hairSegmenterModelPath)) {
+    Write-Host "Downloading MediaPipe Hair Segmenter model..." -ForegroundColor Yellow
+    New-Item -ItemType Directory -Force -Path $modelDir | Out-Null
+    Invoke-WebRequest -Uri $hairSegmenterModelUrl -OutFile $hairSegmenterModelPath
 }
 
 if (-not $env:FACE_LANDMARKER_MODEL_PATH) {
-    $env:FACE_LANDMARKER_MODEL_PATH = $modelPath
+    $env:FACE_LANDMARKER_MODEL_PATH = $faceLandmarkerModelPath
+}
+
+if (-not $env:HAIR_SEGMENTER_MODEL_PATH) {
+    $env:HAIR_SEGMENTER_MODEL_PATH = $hairSegmenterModelPath
 }
 
 Write-Host "Starting Python AI worker on http://localhost:8000" -ForegroundColor Cyan

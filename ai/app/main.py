@@ -6,6 +6,13 @@ from fastapi import FastAPI
 
 from .backend_client import BackendClient
 from .config import get_settings
+from .hair_transfer import (
+    SCHEMA_VERSION,
+    PreparedHairTransfer,
+    compose_texture_hair_transfer,
+    prepare_hair_transfer,
+    with_reference_hair_artifacts,
+)
 from .image_processing import analyze_face_image, compose_hair_fitting, landmarks_json
 from .s3_storage import S3Storage
 from .schemas import FaceProfileJobRequest, HairFittingJobRequest, JobResponse
@@ -76,6 +83,22 @@ def generate_hair_fitting(request: HairFittingJobRequest) -> JobResponse:
         face_key = profile["originalImageObjectKey"]
         face_bytes = storage.download_bytes(face_key)
         reference_bytes = storage.download_bytes(job["referenceImageObjectKey"])
+        if settings.fitting_mode in {"prepare", "texture"}:
+            prepared = prepare_hair_transfer(
+                face_bytes,
+                reference_bytes,
+                face_landmarker_model_path=settings.face_landmarker_model_path,
+                hair_segmenter_model_path=settings.hair_segmenter_model_path,
+            )
+            if settings.fitting_mode == "texture" and job.get("hairDesignId"):
+                prepared = _reuse_saved_hair_design(prepared, job["hairDesignId"], backend, storage)
+            if settings.fitting_mode == "prepare":
+                return _prepare_fitting_job(
+                    request.fitting_job_id, job, prepared, backend, storage
+                )
+            return _complete_texture_fitting_job(
+                request.fitting_job_id, job, prepared, backend, storage
+            )
         face_landmarks = _parse_landmarks(profile.get("landmarksJson"))
         fitting_output = compose_hair_fitting(
             face_bytes,
@@ -83,6 +106,7 @@ def generate_hair_fitting(request: HairFittingJobRequest) -> JobResponse:
             request.fitting_job_id,
             face_landmarks,
             settings.face_landmarker_model_path,
+            settings.hair_segmenter_model_path,
         )
 
         result_key = f"ai/fitting-jobs/{request.fitting_job_id}/result.jpg"
@@ -144,6 +168,159 @@ def generate_hair_fitting(request: HairFittingJobRequest) -> JobResponse:
             },
         )
         return JobResponse(accepted=True, aggregate_id=request.fitting_job_id, status="FAILED")
+
+
+def _prepare_fitting_job(job_id, job, prepared, backend, storage) -> JobResponse:
+    prefix = f"ai/fitting-jobs/{job_id}"
+    keys = {}
+    for filename, (content_type, data) in prepared.artifacts().items():
+        keys[filename] = storage.upload_bytes(f"{prefix}/{filename}", data, content_type)
+
+    manifest = {
+        **prepared.metadata,
+        "jobId": job_id,
+        "artifacts": keys,
+        "sourceObjects": {
+            "profileId": job["profileId"],
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+        },
+    }
+    manifest_key = storage.upload_bytes(
+        f"{prefix}/preparation.json", json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+        "application/json",
+    )
+    # Save diagnostics before updating the reusable design so failures remain inspectable.
+    diagnostics = {
+        "hairMaskObjectKey": keys["hair-mask.png"],
+        "hairLayerObjectKey": keys["hair-layer.png"],
+        "targetHairMaskObjectKey": keys["target-hair-mask.png"],
+        "inpaintingMaskObjectKey": keys["inpainting-mask.png"],
+        "faceProtectionMaskObjectKey": keys["face-protection-mask.png"],
+        "pipelineManifestObjectKey": manifest_key,
+    }
+    backend.update_fitting_job(job_id, {"status": "PROCESSING", **diagnostics})
+    hair_design_id = job.get("hairDesignId")
+    if not hair_design_id:
+        design = backend.upsert_hair_design({
+            "userId": job["userId"],
+            "sourceFittingJobId": job_id,
+            "status": "COMPLETED",
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+            "hairMaskObjectKey": keys["hair-mask.png"],
+            "hairLayerObjectKey": keys["hair-layer.png"],
+            "previewImageObjectKey": keys["hair-layer.png"],
+            "metadataJson": json.dumps({
+                "schemaVersion": prepared.metadata["schemaVersion"],
+                "imageSpace": prepared.metadata.get("imageSpace"),
+                "referenceGeometry": prepared.metadata.get("referenceGeometry", {}),
+                "referenceLandmarks": prepared.metadata.get("referenceLandmarks", []),
+                "segmentation": (prepared.metadata.get("segmentation") or {}).get("reference", {}),
+            }),
+            "failureReason": None,
+        })
+        hair_design_id = design["id"]
+    backend.update_fitting_job(job_id, {
+        "status": "PREPARED", **diagnostics, "hairDesignId": hair_design_id, "failureReason": None,
+    })
+    return JobResponse(accepted=True, aggregate_id=job_id, status="PREPARED")
+
+
+def _reuse_saved_hair_design(
+    prepared: PreparedHairTransfer,
+    hair_design_id: str,
+    backend: BackendClient,
+    storage: S3Storage,
+) -> PreparedHairTransfer:
+    design = backend.get_hair_design(hair_design_id)
+    try:
+        design_metadata = json.loads(design.get("metadataJson") or "{}")
+    except json.JSONDecodeError:
+        design_metadata = {}
+    if design_metadata.get("schemaVersion") != SCHEMA_VERSION:
+        # Older artifacts removed the face-protection polygon from the hair mask,
+        # clipping bangs. Re-extract from the original reference instead.
+        return prepared
+    layer_key = design.get("hairLayerObjectKey")
+    mask_key = design.get("hairMaskObjectKey")
+    if not layer_key or not mask_key:
+        return prepared
+    try:
+        return with_reference_hair_artifacts(
+            prepared,
+            storage.download_bytes(layer_key),
+            storage.download_bytes(mask_key),
+        )
+    except ValueError:
+        # Old legacy designs stored a differently cropped layer. Re-segmenting the
+        # original reference is safer than stretching an incompatible artifact.
+        return prepared
+
+
+def _complete_texture_fitting_job(
+    job_id,
+    job,
+    prepared: PreparedHairTransfer,
+    backend: BackendClient,
+    storage: S3Storage,
+) -> JobResponse:
+    texture_result = compose_texture_hair_transfer(prepared)
+    prefix = f"ai/fitting-jobs/{job_id}"
+    keys = {}
+    artifacts = {**prepared.artifacts(), **texture_result.artifacts()}
+    for filename, (content_type, data) in artifacts.items():
+        keys[filename] = storage.upload_bytes(f"{prefix}/{filename}", data, content_type)
+
+    manifest = {
+        **prepared.metadata,
+        "stage": "COMPLETED",
+        "jobId": job_id,
+        "textureTransfer": texture_result.metadata,
+        "artifacts": keys,
+        "sourceObjects": {
+            "profileId": job["profileId"],
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+        },
+    }
+    manifest_key = storage.upload_bytes(
+        f"{prefix}/texture-transfer.json",
+        json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+        "application/json",
+    )
+
+    hair_design_id = job.get("hairDesignId")
+    if not hair_design_id:
+        design = backend.upsert_hair_design({
+            "userId": job["userId"],
+            "sourceFittingJobId": job_id,
+            "status": "COMPLETED",
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+            "hairMaskObjectKey": keys["hair-mask.png"],
+            "hairLayerObjectKey": keys["hair-layer.png"],
+            "previewImageObjectKey": keys["hair-layer.png"],
+            "metadataJson": json.dumps({
+                "schemaVersion": prepared.metadata["schemaVersion"],
+                "imageSpace": prepared.metadata.get("imageSpace"),
+                "referenceGeometry": prepared.metadata.get("referenceGeometry", {}),
+                "referenceLandmarks": prepared.metadata.get("referenceLandmarks", []),
+                "segmentation": (prepared.metadata.get("segmentation") or {}).get("reference", {}),
+            }, ensure_ascii=False),
+            "failureReason": None,
+        })
+        hair_design_id = design["id"]
+
+    backend.update_fitting_job(job_id, {
+        "status": "COMPLETED",
+        "resultImageObjectKey": keys["result.png"],
+        "hairMaskObjectKey": keys["warped-hair-mask.png"],
+        "hairLayerObjectKey": keys["warped-hair-layer.png"],
+        "targetHairMaskObjectKey": keys["target-hair-mask.png"],
+        "inpaintingMaskObjectKey": keys["edit-mask.png"],
+        "faceProtectionMaskObjectKey": keys["face-protection-mask.png"],
+        "pipelineManifestObjectKey": manifest_key,
+        "hairDesignId": hair_design_id,
+        "failureReason": None,
+    })
+    return JobResponse(accepted=True, aggregate_id=job_id, status="COMPLETED")
 
 
 def _parse_landmarks(raw_landmarks: str | None) -> dict | None:

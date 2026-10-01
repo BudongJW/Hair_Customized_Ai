@@ -17,6 +17,7 @@ export function ResultScreen({
   const [loadingImages, setLoadingImages] = React.useState(false);
   const [previewError, setPreviewError] = React.useState(null);
   const hasResult = fittingJob?.status === "COMPLETED" && fittingJob?.resultImageObjectKey;
+  const isPrepared = fittingJob?.status === "PREPARED";
 
   React.useEffect(() => {
     let mounted = true;
@@ -27,12 +28,21 @@ export function ResultScreen({
         reference: fittingJob?.referenceImageObjectKey,
         result: fittingJob?.resultImageObjectKey,
         mask: fittingJob?.hairMaskObjectKey,
-        layer: fittingJob?.hairLayerObjectKey
+        layer: fittingJob?.hairLayerObjectKey,
+        targetMask: fittingJob?.targetHairMaskObjectKey,
+        inpaintingMask: fittingJob?.inpaintingMaskObjectKey,
+        faceProtection: fittingJob?.faceProtectionMaskObjectKey
       };
+      if (fittingJob?.status === "COMPLETED" && fittingJob?.id) {
+        keys.baldCanvas = `ai/fitting-jobs/${fittingJob.id}/bald-canvas.png`;
+      }
       const entries = Object.entries(keys).filter(([, objectKey]) => Boolean(objectKey));
+      setImageUrls({});
+      setPreviewError(null);
 
       if (entries.length === 0) {
         setImageUrls({});
+        setLoadingImages(false);
         return;
       }
 
@@ -40,7 +50,7 @@ export function ResultScreen({
       setPreviewError(null);
 
       try {
-        const resolved = await Promise.all(
+        const resolved = await Promise.allSettled(
           entries.map(async ([name, objectKey]) => {
             const response = await api.createPresignedDownloadUrl({ objectKey });
             return [name, response.downloadUrl];
@@ -48,7 +58,12 @@ export function ResultScreen({
         );
 
         if (mounted) {
-          setImageUrls(Object.fromEntries(resolved));
+          setImageUrls(Object.fromEntries(
+            resolved.filter((entry) => entry.status === "fulfilled").map((entry) => entry.value)
+          ));
+          if (resolved.some((entry) => entry.status === "rejected")) {
+            setPreviewError("일부 이미지를 불러오지 못했습니다. 화면을 다시 열어 주세요.");
+          }
         }
       } catch (error) {
         if (mounted) {
@@ -72,7 +87,12 @@ export function ResultScreen({
     fittingJob?.referenceImageObjectKey,
     fittingJob?.resultImageObjectKey,
     fittingJob?.hairMaskObjectKey,
-    fittingJob?.hairLayerObjectKey
+    fittingJob?.hairLayerObjectKey,
+    fittingJob?.targetHairMaskObjectKey,
+    fittingJob?.inpaintingMaskObjectKey,
+    fittingJob?.faceProtectionMaskObjectKey,
+    fittingJob?.id,
+    fittingJob?.status
   ]);
 
   return (
@@ -105,12 +125,20 @@ export function ResultScreen({
       </View>
 
       <Panel>
-        <Text style={styles.sectionTitle}>{hasResult ? "완료된 결과" : "아직 완료되지 않은 작업"}</Text>
-        {imageUrls.result ? (
+        <Text style={styles.sectionTitle}>
+          {hasResult ? "완료된 결과" : isPrepared ? "합성 준비 완료" : fittingJob?.status === "FAILED" ? "처리 실패" : "처리 중"}
+        </Text>
+        {hasResult && imageUrls.result ? (
           <Image source={{ uri: imageUrls.result }} style={styles.resultImage} />
         ) : (
           <View style={styles.emptyResult}>
-            <Text style={styles.emptyText}>AI worker가 완료되면 이곳에 결과 이미지가 표시됩니다.</Text>
+            <Text style={styles.emptyText}>
+              {isPrepared
+                ? "사진 분석과 마스크 저장이 완료되었습니다. 아직 합성 이미지는 생성되지 않았습니다."
+                : fittingJob?.status === "FAILED"
+                  ? fittingJob.failureReason || "사진을 처리하지 못했습니다."
+                  : "결과 이미지를 준비하고 있습니다."}
+            </Text>
           </View>
         )}
         <Text style={styles.objectKey}>참고 사진: {fittingJob?.referenceImageObjectKey || "-"}</Text>
@@ -122,14 +150,28 @@ export function ResultScreen({
       </Panel>
 
       {(imageUrls.mask || imageUrls.layer) && (
-        <Panel>
+        <View style={styles.debugSection}>
           <Text style={styles.sectionTitle}>헤어 분석 디버그</Text>
           <View style={styles.compareRow}>
             <PreviewPanel title="헤어마스크" imageUrl={imageUrls.mask} />
             <PreviewPanel title="분리된 헤어레이어" imageUrl={imageUrls.layer} />
           </View>
           <Text style={styles.meta}>마스크와 레이어를 보면 머리카락이 어디까지 잘렸는지 확인할 수 있습니다.</Text>
-        </Panel>
+        </View>
+      )}
+
+      {(imageUrls.targetMask || imageUrls.inpaintingMask || imageUrls.faceProtection) && (
+        <View style={styles.debugSection}>
+          <Text style={styles.sectionTitle}>사용자 머리 분석</Text>
+          <View style={styles.compareRow}>
+            <PreviewPanel title="기존 머리 영역" imageUrl={imageUrls.targetMask} />
+            <PreviewPanel title="합성 수정 영역" imageUrl={imageUrls.inpaintingMask} />
+          </View>
+          <View style={styles.compareRow}>
+            <PreviewPanel title="얼굴 보호 영역" imageUrl={imageUrls.faceProtection} />
+            <PreviewPanel title="머리 제거 결과" imageUrl={imageUrls.baldCanvas} />
+          </View>
+        </View>
       )}
 
       <View style={styles.buttonRow}>
@@ -206,7 +248,11 @@ const styles = StyleSheet.create({
   },
   comparePanel: {
     flex: 1,
+    minWidth: 0,
     minHeight: 230
+  },
+  debugSection: {
+    gap: spacing.sm
   },
   compareLabel: {
     color: colors.muted,

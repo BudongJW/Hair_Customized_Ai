@@ -53,6 +53,10 @@ public class DevMockAiController {
                 "results/fitting-jobs/%s/hair-mask.png".formatted(jobId),
                 "results/fitting-jobs/%s/hair-layer.png".formatted(jobId),
                 null,
+                null,
+                null,
+                null,
+                null,
                 null
             )
         );

@@ -60,6 +60,10 @@ public class FittingJobController {
                 request.resultImageObjectKey(),
                 request.hairMaskObjectKey(),
                 request.hairLayerObjectKey(),
+                request.targetHairMaskObjectKey(),
+                request.inpaintingMaskObjectKey(),
+                request.faceProtectionMaskObjectKey(),
+                request.pipelineManifestObjectKey(),
                 request.hairDesignId(),
                 request.failureReason()
             )
@@ -78,6 +82,10 @@ public class FittingJobController {
         @Size(max = 512) String resultImageObjectKey,
         @Size(max = 512) String hairMaskObjectKey,
         @Size(max = 512) String hairLayerObjectKey,
+        @Size(max = 512) String targetHairMaskObjectKey,
+        @Size(max = 512) String inpaintingMaskObjectKey,
+        @Size(max = 512) String faceProtectionMaskObjectKey,
+        @Size(max = 512) String pipelineManifestObjectKey,
         UUID hairDesignId,
         @Size(max = 1000) String failureReason
     ) {
@@ -93,6 +101,10 @@ public class FittingJobController {
         String resultImageObjectKey,
         String hairMaskObjectKey,
         String hairLayerObjectKey,
+        String targetHairMaskObjectKey,
+        String inpaintingMaskObjectKey,
+        String faceProtectionMaskObjectKey,
+        String pipelineManifestObjectKey,
         String failureReason,
         OffsetDateTime completedAt,
         OffsetDateTime createdAt,
@@ -109,6 +121,10 @@ public class FittingJobController {
                 job.getResultImageObjectKey(),
                 job.getHairMaskObjectKey(),
                 job.getHairLayerObjectKey(),
+                job.getTargetHairMaskObjectKey(),
+                job.getInpaintingMaskObjectKey(),
+                job.getFaceProtectionMaskObjectKey(),
+                job.getPipelineManifestObjectKey(),
                 job.getFailureReason(),
                 job.getCompletedAt(),
                 job.getCreatedAt(),

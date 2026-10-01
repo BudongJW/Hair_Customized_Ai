@@ -44,11 +44,12 @@ AWS_REGION=ap-northeast-2
 APP_STORAGE_BUCKET=hair-customized-ai-aaron-dev
 AI_WORKER_BACKEND_BASE_URL=http://localhost:8080
 FACE_LANDMARKER_MODEL_PATH=C:\Users\aaron\Project\Hair_Customized_Ai\ai\models\face_landmarker.task
+HAIR_SEGMENTER_MODEL_PATH=C:\Users\aaron\Project\Hair_Customized_Ai\ai\models\hair_segmenter.tflite
 ```
 
-`FACE_LANDMARKER_MODEL_PATH`는 생략해도 기본값으로 `ai/models/face_landmarker.task`를 사용합니다. `scripts/run-ai.ps1`는 모델 파일이 없으면 자동으로 다운로드합니다.
+모델 경로는 생략해도 기본값으로 `ai/models` 아래 파일을 사용합니다. `scripts/run-ai.ps1`는 Face Landmarker와 Hair Segmenter 모델 파일이 없으면 자동으로 다운로드합니다.
 
-AWS 키는 코드, frontend `.env`, Git에 올리지 마세요. 실제 `.env.backend`, `ai/.env`, `frontend/.env`, `ai/models/*.task`는 `.gitignore`에 제외되어 있습니다.
+AWS 키는 코드, frontend `.env`, Git에 올리지 마세요. 실제 `.env.backend`, `ai/.env`, `frontend/.env`, `ai/models/*.task`, `ai/models/*.tflite`는 `.gitignore`에 제외되어 있습니다.
 
 ## 개별 실행
 
@@ -62,4 +63,4 @@ AWS 키는 코드, frontend `.env`, Git에 올리지 마세요. 실제 `.env.bac
 
 ## AI 단계
 
-현재 Python worker는 MediaPipe Face Landmarker를 사용해 내 얼굴의 실제 얼굴 랜드마크와 기울기를 DB에 저장합니다. 헤어 피팅에서는 저장된 얼굴 위치/기울기 정보를 기준으로 헤어모델 사진의 머리카락 후보 영역을 맞춰 합성합니다.
+현재 Python worker는 MediaPipe Face Landmarker로 얼굴 기준점을 잡고, MediaPipe HairSegmenter로 헤어모델 사진의 머리카락 mask를 생성합니다. 헤어 피팅에서는 저장된 얼굴 위치/기울기 정보를 기준으로 분리된 헤어레이어를 맞춰 합성합니다.

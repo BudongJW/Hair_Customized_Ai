@@ -32,9 +32,8 @@ export function HistoryScreen({ user, fittingJobs = [], onBack, onOpenResult }) 
                 <StatusPill status={job.status} />
               </View>
               <PrimaryButton
-                label={job.status === "COMPLETED" ? "결과 보기" : "완료 후 확인 가능"}
+                label={job.status === "PREPARED" ? "준비 결과 보기" : job.status === "COMPLETED" ? "결과 보기" : "처리 상태 보기"}
                 onPress={() => onOpenResult(job)}
-                disabled={job.status !== "COMPLETED"}
               />
             </Panel>
           ))}

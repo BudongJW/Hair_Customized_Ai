@@ -14,6 +14,10 @@ function choosePrimaryFaceProfile(profiles) {
   return profiles.find((profile) => profile.status === "COMPLETED") || profiles[0] || null;
 }
 
+function chooseCompletedFaceProfile(profiles) {
+  return profiles.find((profile) => profile.status === "COMPLETED") || null;
+}
+
 function replaceById(items, nextItem) {
   const exists = items.some((item) => item.id === nextItem.id);
   if (!exists) {
@@ -21,6 +25,9 @@ function replaceById(items, nextItem) {
   }
   return items.map((item) => (item.id === nextItem.id ? nextItem : item));
 }
+
+const ACTIVE_FITTING_STATUSES = new Set(["PENDING", "PROCESSING"]);
+const FINISHED_FITTING_STATUSES = new Set(["PREPARED", "COMPLETED", "FAILED", "REJECTED"]);
 
 export default function App() {
   const [view, setView] = React.useState("auth");
@@ -30,6 +37,41 @@ export default function App() {
   const [faceProfile, setFaceProfile] = React.useState(null);
   const [fittingJobs, setFittingJobs] = React.useState([]);
   const [fittingJob, setFittingJob] = React.useState(null);
+
+  React.useEffect(() => {
+    if (!fittingJob?.id || !ACTIVE_FITTING_STATUSES.has(fittingJob.status)) {
+      return undefined;
+    }
+
+    let cancelled = false;
+    let timerId;
+
+    const pollFittingJob = async () => {
+      try {
+        const latestJob = await api.getFittingJob(fittingJob.id);
+        if (cancelled) {
+          return;
+        }
+        setFittingJobs((items) => replaceById(items, latestJob));
+        setFittingJob(latestJob);
+        if (FINISHED_FITTING_STATUSES.has(latestJob.status)) {
+          setView((currentView) => currentView === "hair" ? "result" : currentView);
+          return;
+        }
+      } catch {
+        // Transient mobile-network failures should not force a logout or stop polling.
+      }
+      if (!cancelled) {
+        timerId = setTimeout(pollFittingJob, 2000);
+      }
+    };
+
+    timerId = setTimeout(pollFittingJob, 800);
+    return () => {
+      cancelled = true;
+      clearTimeout(timerId);
+    };
+  }, [fittingJob?.id, fittingJob?.status]);
 
   const restoreUserData = async (authenticatedUser) => {
     setUser(authenticatedUser);
@@ -77,13 +119,39 @@ export default function App() {
     setFittingJob(job);
   };
 
-  const openHairFitting = () => {
-    if (!faceProfile || faceProfile.status !== "COMPLETED") {
-      Alert.alert("얼굴 분석 필요", "먼저 내 얼굴 등록 후 AI 분석을 완료해 주세요.");
-      setView("face");
+  const openHairFitting = async () => {
+    if (loadingUserData) {
       return;
     }
-    setView("hair");
+
+    try {
+      setLoadingUserData(true);
+      const profiles = await api.listFaceProfiles(user.id);
+      const completedProfile = chooseCompletedFaceProfile(profiles);
+
+      setFaceProfiles(profiles);
+      setFaceProfile(completedProfile || choosePrimaryFaceProfile(profiles));
+
+      if (!completedProfile) {
+        const analysisInProgress = profiles.some((profile) =>
+          ["PENDING", "PROCESSING"].includes(profile.status)
+        );
+        Alert.alert(
+          analysisInProgress ? "얼굴 분석 진행 중" : "얼굴 분석 필요",
+          analysisInProgress
+            ? "등록한 얼굴의 AI 분석이 아직 끝나지 않았습니다. 얼굴 등록 화면에서 분석 상태를 새로고침해 주세요."
+            : "먼저 내 얼굴을 등록하고 AI 분석을 완료해 주세요."
+        );
+        setView("face");
+        return;
+      }
+
+      setView("hair");
+    } catch (error) {
+      Alert.alert("얼굴 프로필 확인 실패", error.message);
+    } finally {
+      setLoadingUserData(false);
+    }
   };
 
   if (!user) {

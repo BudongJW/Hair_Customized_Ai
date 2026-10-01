@@ -51,6 +51,18 @@ public class FittingJob extends BaseEntity {
     @Column(length = 512)
     private String hairLayerObjectKey;
 
+    @Column(length = 512)
+    private String targetHairMaskObjectKey;
+
+    @Column(length = 512)
+    private String inpaintingMaskObjectKey;
+
+    @Column(length = 512)
+    private String faceProtectionMaskObjectKey;
+
+    @Column(length = 512)
+    private String pipelineManifestObjectKey;
+
     @Column(length = 1000)
     private String failureReason;
 

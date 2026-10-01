@@ -1,4 +1,7 @@
-﻿const envBaseUrl =
+  import { File } from "expo-file-system";
+import { fetch } from "expo/fetch";
+
+const envBaseUrl =
   typeof process !== "undefined" && process.env
     ? process.env.EXPO_PUBLIC_API_BASE_URL
     : undefined;
@@ -52,15 +55,14 @@ function normalizeUploadUrl(uploadUrl) {
 }
 
 async function uploadLocalImage(upload, imageUri, contentType) {
-  const fileResponse = await fetch(imageUri);
-  const blob = await fileResponse.blob();
+  const file = new File(imageUri);
   const response = await fetch(normalizeUploadUrl(upload.uploadUrl), {
     method: "PUT",
     headers: {
       ...(upload.headers || {}),
       "Content-Type": contentType
     },
-    body: blob
+    body: file
   });
 
   if (!response.ok) {
@@ -133,6 +135,6 @@ export const api = {
     return request(`/api/v1/fitting-jobs?userId=${encodeURIComponent(userId)}`);
   },
   getFittingJob(jobId) {
-    return request(`/api/v1/fitting-jobs/${jobId}`);
+    return request(`/api/v1/fitting-jobs/${jobId}?requestTime=${Date.now()}`);
   }
 };

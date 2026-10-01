@@ -59,6 +59,10 @@ public class FittingJobService {
             result.resultImageObjectKey(),
             result.hairMaskObjectKey(),
             result.hairLayerObjectKey(),
+            result.targetHairMaskObjectKey(),
+            result.inpaintingMaskObjectKey(),
+            result.faceProtectionMaskObjectKey(),
+            result.pipelineManifestObjectKey(),
             result.hairDesignId(),
             result.failureReason(),
             completedAt,
@@ -94,6 +98,10 @@ public class FittingJobService {
         String resultImageObjectKey,
         String hairMaskObjectKey,
         String hairLayerObjectKey,
+        String targetHairMaskObjectKey,
+        String inpaintingMaskObjectKey,
+        String faceProtectionMaskObjectKey,
+        String pipelineManifestObjectKey,
         UUID hairDesignId,
         String failureReason
     ) {

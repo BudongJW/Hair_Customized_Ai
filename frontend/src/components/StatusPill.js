@@ -5,6 +5,7 @@ import { colors, radius, spacing } from "../theme/tokens";
 const palette = {
   PENDING: [colors.softGold, colors.danger],
   PROCESSING: [colors.softTeal, colors.teal],
+  PREPARED: [colors.softGold, colors.ink],
   COMPLETED: [colors.softTeal, colors.green],
   FAILED: [colors.softCoral, colors.coral],
   REJECTED: [colors.softCoral, colors.coral]
@@ -14,7 +15,7 @@ export function StatusPill({ status = "READY" }) {
   const [backgroundColor, color] = palette[status] || ["#EEF2F6", colors.muted];
   return (
     <View style={[styles.pill, { backgroundColor }]}>
-      <Text style={[styles.text, { color }]}>{status}</Text>
+      <Text style={[styles.text, { color }]}>{status === "PREPARED" ? "합성 준비 완료" : status}</Text>
     </View>
   );
 }

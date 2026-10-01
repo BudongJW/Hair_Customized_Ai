@@ -30,6 +30,7 @@ export function HairFittingScreen({
     )
   );
   const jobCompleted = fittingJob?.status === "COMPLETED";
+  const jobPrepared = fittingJob?.status === "PREPARED";
 
   useEffect(() => {
     loadHairDesigns();
@@ -113,7 +114,7 @@ export function HairFittingScreen({
 
       const job = await api.createFittingJob(payload);
       onFittingJobChanged(job);
-      Alert.alert("AI 피팅 요청 완료", "Python AI worker가 헤어마스크와 합성 결과를 생성합니다.");
+      Alert.alert("피팅 요청 완료", "사진 분석을 시작했습니다. 잠시 후 처리 상태를 확인해 주세요.");
     } catch (error) {
       Alert.alert("피팅 작업 생성 실패", error.message);
     } finally {
@@ -130,7 +131,7 @@ export function HairFittingScreen({
       setLoading(true);
       const job = await api.getFittingJob(fittingJob.id);
       onFittingJobChanged(job);
-      if (job.status === "COMPLETED") {
+      if (["COMPLETED", "PREPARED", "FAILED", "REJECTED"].includes(job.status)) {
         await loadHairDesigns();
         onFittingCompleted(job);
       }
@@ -241,7 +242,7 @@ export function HairFittingScreen({
             <StatusPill status={fittingJob.status} />
           </View>
           <PrimaryButton
-            label={jobCompleted ? "결과 보기" : "AI 피팅 상태 새로고침"}
+            label={jobPrepared ? "준비 결과 보기" : jobCompleted ? "결과 보기" : "AI 피팅 상태 새로고침"}
             onPress={refreshFittingJob}
             loading={loading}
           />
