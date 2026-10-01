@@ -10,15 +10,15 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 AI_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(AI_ROOT))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.hair_alignment import _tps_map, transfer_hair  # noqa: E402
-from app.hair_removal import LEFT_EYE_INDICES, HeadSegmentation, push_pull_inpaint  # noqa: E402
-from test_hair_removal import BACKGROUND, _synthetic_portrait  # noqa: E402
+from app.hair_removal import FACE_OVAL_INDICES, LEFT_EYE_INDICES, HeadSegmentation, push_pull_inpaint  # noqa: E402
+from test_hair_removal import BACKGROUND, SKIN, _synthetic_portrait  # noqa: E402
 
 
 def _scaled(image, landmarks, segmentation, factor):
@@ -104,6 +104,75 @@ class TransferTest(unittest.TestCase):
         for name in ("result.png", "warped-hair-layer.png", "warped-hair-mask.png", "bald-canvas.png"):
             self.assertIn(name, artifacts)
             self.assertTrue(artifacts[name][1].startswith(b"\x89PNG"), name)
+
+
+class LendingTest(unittest.TestCase):
+    """The hair model's photo can show what the user's photo hides (ears, forehead skin)."""
+
+    @classmethod
+    def setUpClass(cls):
+        image, landmarks, segmentation, points, hair_mask = _synthetic_portrait()
+        width, height = image.size
+        oval = points[[234, 454]]
+        unit = float(oval[1, 0] - oval[0, 0])
+        ear_y = float((points[105][1] + points[2][1]) / 2)
+        cls.ear_centers = [(oval[0, 0] - 0.07 * unit, ear_y), (oval[1, 0] + 0.07 * unit, ear_y)]
+
+        def ears_mask():
+            canvas = Image.new("L", image.size, 0)
+            draw = ImageDraw.Draw(canvas)
+            for x, y in cls.ear_centers:
+                draw.ellipse((x - 0.06 * unit, y - 0.12 * unit, x + 0.06 * unit, y + 0.12 * unit), fill=255)
+            return np.asarray(canvas) > 127
+
+        ears = ears_mask()
+        oval_canvas = Image.new("L", image.size, 0)
+        ImageDraw.Draw(oval_canvas).polygon([tuple(p) for p in points[FACE_OVAL_INDICES]], fill=255)
+        face = np.asarray(oval_canvas) > 127
+
+        # Hair model: a short cap that leaves the forehead and both ears visible.
+        cap = hair_mask & (np.arange(height)[:, None] < points[10][1] - 0.05 * unit)
+        reference = np.asarray(image).copy()
+        reference[hair_mask & ~cap] = BACKGROUND
+        reference[(face | ears) & ~cap] = SKIN
+        cls.reference = Image.fromarray(reference)
+        cls.reference_landmarks = landmarks
+        cls.reference_segmentation = HeadSegmentation(
+            hair=cap.astype(np.float32), face_skin=((face | ears) & ~cap).astype(np.float32), source="synthetic"
+        )
+
+        # User: the old hair also hangs over both ears.
+        side_hair = np.zeros_like(hair_mask)
+        for x, _y in cls.ear_centers:
+            side_hair[int(points[105][1]) : int(points[2][1] + 0.1 * unit), int(x - 0.1 * unit) : int(x + 0.1 * unit)] = True
+        user_hair = hair_mask | side_hair
+        target = np.asarray(image).copy()
+        target[user_hair] = (38, 30, 26)
+        cls.target = Image.fromarray(target)
+        cls.target_landmarks = landmarks
+        cls.target_segmentation = HeadSegmentation(
+            hair=user_hair.astype(np.float32), face_skin=(face & ~user_hair).astype(np.float32), source="synthetic"
+        )
+        cls.result = transfer_hair(
+            cls.target,
+            cls.target_landmarks,
+            cls.reference,
+            cls.reference_landmarks,
+            target_segmentation=cls.target_segmentation,
+            reference_segmentation=cls.reference_segmentation,
+            inpainter=push_pull_inpaint,
+        )
+
+    def test_hidden_ears_are_lent_from_the_hair_model(self):
+        self.assertGreater(self.result.metadata["lentEarPixelCount"], 0)
+        output = np.asarray(self.result.image, dtype=np.float32)
+        for x, y in self.ear_centers:
+            pixel = output[int(y), int(x)]
+            self.assertLess(float(np.abs(pixel - np.array(SKIN)).max()), 45.0, (x, y, pixel))
+
+    def test_forehead_skin_texture_is_lent(self):
+        self.assertGreater(self.result.metadata["lentSkinTexturePixelCount"], 0)
+        self.assertTrue(np.isfinite(np.asarray(self.result.image, dtype=np.float32)).all())
 
 
 class ThinPlateSplineTest(unittest.TestCase):

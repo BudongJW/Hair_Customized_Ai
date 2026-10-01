@@ -570,9 +570,9 @@ def _render_scalp(
     dv = np.minimum(v - skull.center_v, 0.0) / skull.radius_v
     radial = np.clip(du**2 + dv**2, 0.0, 1.0)
     normal_z = np.sqrt(1.0 - radial)
-    shade = 1.0 - 0.16 * (1.0 - normal_z) ** 1.4
+    shade = 1.0 - 0.30 * (1.0 - normal_z) ** 1.1
     highlight_v = skull.top_v + skull.radius_v * 0.38
-    highlight = 0.035 * np.exp(-(du / 0.55) ** 2 - ((v - highlight_v) / (skull.radius_v * 0.35)) ** 2)
+    highlight = 0.02 * np.exp(-(du / 0.55) ** 2 - ((v - highlight_v) / (skull.radius_v * 0.35)) ** 2)
 
     dome = (base + du[..., None] * slope) * shade[..., None] + 255.0 * highlight[..., None]
     dome += _skin_grain(rgb, skin_samples, unit)[..., None]
