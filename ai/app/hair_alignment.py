@@ -58,7 +58,12 @@ WARP_GRID_STEP = 6
 NOSE_BOTTOM_INDEX = 2
 LEFT_FACE_EDGE_INDEX = 234
 RIGHT_FACE_EDGE_INDEX = 454
-METADATA_VERSION = "hair-transfer-v2-skull-tps"
+# White balance: only near-neutral backdrops (each channel within this of the mean) are
+# read as light colour; the hair gets this fraction of the tint ratio, capped.
+NEUTRAL_BACKDROP_MAX_TINT = 0.12
+WHITE_BALANCE_STRENGTH = 0.7
+WHITE_BALANCE_MAX_SHIFT = 0.12
+METADATA_VERSION = "hair-transfer-v3-skull-tps"
 
 
 @dataclass(frozen=True)
@@ -169,7 +174,8 @@ def transfer_hair(
     )
     warped_alpha = _fade_hairline(warped_alpha, scalp_fill, target_skull.face_width)
     exposure = _exposure_match(layer, canvas, target_points, target_segmentation)
-    hair_rgb = np.clip(warped_rgb * exposure, 0.0, 255.0)
+    white_balance = _white_balance_gain(target_rgb, target_segmentation, layer.source_rgb, reference_segmentation)
+    hair_rgb = np.clip(warped_rgb * exposure * white_balance, 0.0, 255.0)
     canvas, back_hair_pixels = _fill_back_hair(canvas, hair_rgb, warped_alpha, target_skull, target_segmentation)
     result = _composite(canvas, hair_rgb, warped_alpha, target_skull.face_width)
     changed = np.abs(result - target_rgb).max(axis=2) > 2.0
@@ -182,6 +188,7 @@ def transfer_hair(
         "hairRemoval": bald.metadata,
         "warp": warp.info,
         "exposureFactor": exposure,
+        "whiteBalanceGain": [round(float(g), 3) for g in white_balance],
         "backHairPixelCount": back_hair_pixels,
         "lentSkinTexturePixelCount": forehead_pixels,
         "lentEarPixelCount": ear_pixels,
@@ -588,6 +595,43 @@ def _fill_back_hair(
     back_color = np.median(hair_rgb[alpha > 0.9], axis=0) * 0.45 if (alpha > 0.9).any() else np.zeros(3)
     weight = np.clip(_blur(gap.astype(np.float32), max(1.0, 0.01 * unit)), 0.0, 1.0)[..., None] * 0.92
     return canvas * (1.0 - weight) + back_color * weight, int(gap.sum())
+
+
+def _white_balance_gain(
+    target_rgb: np.ndarray,
+    target_segmentation: HeadSegmentation,
+    reference_rgb: np.ndarray | None,
+    reference_segmentation: HeadSegmentation,
+) -> np.ndarray:
+    """Tint the borrowed hair with the colour of the user's light.
+
+    A neutral (grey/white) backdrop shows the colour of the light it is lit with, so the
+    ratio of the two backdrops' tints tells how to re-light the hair model's hair. A
+    coloured or black backdrop tells nothing (paint, not light), so the hair is left as is.
+    """
+
+    target_tint = _neutral_backdrop_tint(target_rgb, target_segmentation)
+    reference_tint = None if reference_rgb is None else _neutral_backdrop_tint(reference_rgb, reference_segmentation)
+    if target_tint is None or reference_tint is None:
+        return np.ones(3, dtype=np.float32)
+    gain = (target_tint / reference_tint) ** WHITE_BALANCE_STRENGTH
+    return np.clip(gain, 1.0 - WHITE_BALANCE_MAX_SHIFT, 1.0 + WHITE_BALANCE_MAX_SHIFT).astype(np.float32)
+
+
+def _neutral_backdrop_tint(rgb: np.ndarray, segmentation: HeadSegmentation) -> np.ndarray | None:
+    if segmentation.background is None:
+        return None
+    backdrop = segmentation.background > 0.9
+    if backdrop.sum() < 2000:
+        return None
+    color = np.median(rgb[backdrop], axis=0)
+    level = float(color.mean())
+    if level < 40.0:
+        return None
+    tint = color / level
+    if float(np.abs(tint - 1.0).max()) > NEUTRAL_BACKDROP_MAX_TINT:
+        return None
+    return tint
 
 
 def _composite(canvas: np.ndarray, hair_rgb: np.ndarray, alpha: np.ndarray, unit: float) -> np.ndarray:

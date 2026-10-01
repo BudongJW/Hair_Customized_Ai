@@ -150,6 +150,82 @@ class HairRemovalTest(unittest.TestCase):
             self.assertTrue(data.startswith(b"\x89PNG"), name)
 
 
+class LongHairOnPlainBackgroundTest(unittest.TestCase):
+    """Long hair over the shoulders on a plain backdrop: above the shoulder line the hole
+    must become clean background, not a blend of backdrop and clothes colours."""
+
+    CLOTHES = (70, 60, 110)
+
+    @classmethod
+    def setUpClass(cls):
+        image, landmarks, segmentation, points, hair_mask = _synthetic_portrait()
+        width, height = image.size
+        oval = points[FACE_OVAL_INDICES]
+        unit = float(oval[:, 0].max() - oval[:, 0].min())
+        cls.shoulder_y = int(points[152][1] + 0.35 * unit)
+
+        pixels = np.asarray(image).copy()
+        clothes = np.zeros((height, width), dtype=bool)
+        clothes[cls.shoulder_y :, :] = True
+        pixels[clothes] = cls.CLOTHES
+
+        # Two curtains of hair from the temples down over the shoulders.
+        curtains = np.zeros_like(clothes)
+        for x in (oval[:, 0].min() - 0.18 * unit, oval[:, 0].max() + 0.02 * unit):
+            curtains[int(points[10][1]) : int(cls.shoulder_y + 0.3 * unit), int(x) : int(x + 0.16 * unit)] = True
+        hair = hair_mask | curtains
+        pixels[hair] = HAIR
+        cls.curtains = curtains & ~hair_mask
+
+        face = segmentation.face_skin > 0.5
+        background = ~(hair | clothes | face)
+        cls.result = remove_hair(
+            Image.fromarray(pixels),
+            landmarks,
+            segmentation=HeadSegmentation(
+                hair=hair.astype(np.float32),
+                face_skin=segmentation.face_skin,
+                source="synthetic",
+                background=background.astype(np.float32),
+                clothes=(clothes & ~hair).astype(np.float32),
+            ),
+            inpainter=push_pull_inpaint,
+        )
+
+    def test_background_above_the_shoulders_is_restored(self):
+        output = np.asarray(self.result.image, dtype=np.float32)
+        skull = np.asarray(self.result.skull_mask) > 127
+        region = self.curtains & ~skull
+        region[self.shoulder_y - 8 :, :] = False
+        self.assertGreater(region.sum(), 1000)
+        error = np.abs(output[region] - np.array(BACKGROUND)).max(axis=1)
+        self.assertLess(float(np.percentile(error, 95)), 8.0)
+        self.assertGreater(self.result.metadata["rebuiltBackgroundPixelCount"], 0)
+
+    def test_clothes_below_the_shoulder_line_are_not_painted_as_background(self):
+        output = np.asarray(self.result.image, dtype=np.float32)
+        region = self.curtains.copy()
+        region[: self.shoulder_y + 12, :] = False
+        distance_to_background = np.abs(output[region] - np.array(BACKGROUND)).max(axis=1)
+        self.assertGreater(float(np.median(distance_to_background)), 60.0)
+
+
+class ForeheadHighlightTest(unittest.TestCase):
+    def test_matte_skin_gets_no_highlight(self):
+        from app.hair_removal import _estimate_skull, _face_frame, _forehead_highlight, _landmark_pixels, _local_grid
+
+        image, landmarks, segmentation, _points, _hair = _synthetic_portrait()
+        width, height = image.size
+        rgb = np.asarray(image, dtype=np.float32)
+        points = _landmark_pixels(landmarks, width, height)
+        frame = _face_frame(points)
+        grid = _local_grid(frame, width, height)
+        skull = _estimate_skull(frame, points, segmentation)
+        flat_skin = segmentation.face_skin > 0.5  # one flat colour: nothing shinier than the median
+        highlight = _forehead_highlight(rgb, flat_skin, frame.to_local(points), grid[..., 0], grid[..., 1], skull)
+        self.assertEqual(float(np.abs(highlight).max()), 0.0)
+
+
 class NoHairTest(unittest.TestCase):
     def test_bald_input_is_returned_unchanged(self):
         image, landmarks, segmentation, _points, _hair = _synthetic_portrait()

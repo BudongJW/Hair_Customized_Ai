@@ -203,6 +203,29 @@ class SkinTextureEdgeTest(unittest.TestCase):
         self.assertGreater(float(lent.min()), 199.0)
 
 
+class WhiteBalanceTest(unittest.TestCase):
+    @staticmethod
+    def _photo(backdrop):
+        rgb = np.zeros((100, 100, 3), dtype=np.float32)
+        rgb[:] = backdrop
+        segmentation = HeadSegmentation(hair=np.zeros((100, 100), dtype=np.float32), background=np.ones((100, 100), dtype=np.float32))
+        return rgb, segmentation
+
+    def test_warm_light_warms_the_hair(self):
+        warm, warm_segmentation = self._photo((240, 226, 205))
+        neutral, neutral_segmentation = self._photo((228, 228, 228))
+        gain = ha._white_balance_gain(warm, warm_segmentation, neutral, neutral_segmentation)
+        self.assertGreater(gain[0], 1.0)
+        self.assertLess(gain[2], 1.0)
+
+    def test_coloured_or_black_backdrop_leaves_the_hair_alone(self):
+        blue_wall, blue_segmentation = self._photo((90, 140, 230))
+        black, black_segmentation = self._photo((10, 10, 12))
+        neutral, neutral_segmentation = self._photo((228, 228, 228))
+        np.testing.assert_allclose(ha._white_balance_gain(blue_wall, blue_segmentation, neutral, neutral_segmentation), 1.0)
+        np.testing.assert_allclose(ha._white_balance_gain(black, black_segmentation, neutral, neutral_segmentation), 1.0)
+
+
 class ThinPlateSplineTest(unittest.TestCase):
     def test_interpolates_control_points(self):
         rng = np.random.default_rng(1)

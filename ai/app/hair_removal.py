@@ -51,6 +51,13 @@ JAW_LEFT_INDEX = 172
 JAW_RIGHT_INDEX = 397
 # Neck half-width relative to half the distance between the jaw angles.
 NECK_WIDTH_SCALE = 0.80
+# Robust luminance spread (MAD, 0-255) under which the background counts as plain enough to
+# be rebuilt as a smooth field instead of being left to the inpainter.
+PLAIN_BACKGROUND_MAX_SPREAD = 10.0
+# Forehead highlight = scale * (how much brighter the face's 97th percentile is than its
+# median), capped. Matte skin gets none, shiny skin a visible sheen.
+FOREHEAD_HIGHLIGHT_SCALE = 0.45
+FOREHEAD_HIGHLIGHT_MAX = 0.08
 # How much of the seam colour offset reaches the middle of the synthetic scalp.
 SEAM_FAR_WEIGHT = 0.35
 SEAM_FAR_LIMIT = 15.0
@@ -64,9 +71,11 @@ SKULL_TOP_SCALE = 0.36
 SKULL_CENTER_OFFSET = 0.12
 
 # Selfie multiclass categories: 0 background, 1 hair, 2 body skin, 3 face skin, 4 clothes, 5 others.
+MULTICLASS_BACKGROUND = 0
 MULTICLASS_HAIR = 1
 MULTICLASS_BODY_SKIN = 2
 MULTICLASS_FACE_SKIN = 3
+MULTICLASS_CLOTHES = 4
 
 LAMA_SIZE = 512
 METADATA_VERSION = "hair-removal-v1-skull-split"
@@ -82,6 +91,8 @@ class HeadSegmentation:
     face_skin: np.ndarray | None = None
     body_skin: np.ndarray | None = None
     source: str = "provided"
+    background: np.ndarray | None = None
+    clothes: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -202,6 +213,9 @@ def remove_hair(
     background_region = removal & ~skull_mask
 
     background = _fill_background(rgb, skull_mask | removal, inpainter, unit)
+    background, silhouette_pixels = _restore_body_silhouette(
+        background, rgb, background_region, segmentation, points, unit
+    )
     background, neck_pixels = _rebuild_neck(
         background, rgb, background_region, segmentation.body_skin, points, frame, local_grid, unit
     )
@@ -248,6 +262,7 @@ def remove_hair(
         "scalpFillPixelCount": int(scalp_region.sum()),
         "backgroundFillPixelCount": int(background_region.sum()),
         "rebuiltNeckPixelCount": neck_pixels,
+        "rebuiltBackgroundPixelCount": silhouette_pixels,
         "scalpToneGain": forehead_gain,
         "redrawnEyebrows": brows_redrawn,
     }
@@ -284,7 +299,7 @@ def segment_head(
     rgb = np.ascontiguousarray(np.asarray(image.convert("RGB")))
     height, width = rgb.shape[:2]
     hair_parts: list[np.ndarray] = []
-    face_skin = body_skin = None
+    face_skin = body_skin = background = clothes = None
     sources: list[str] = []
 
     multiclass_path = multiclass_model_path or str(DEFAULT_SELFIE_MULTICLASS_MODEL_PATH)
@@ -293,6 +308,9 @@ def segment_head(
         hair_parts.append(confidences[MULTICLASS_HAIR])
         body_skin = confidences[MULTICLASS_BODY_SKIN]
         face_skin = confidences[MULTICLASS_FACE_SKIN]
+        background = confidences[MULTICLASS_BACKGROUND]
+        if len(confidences) > MULTICLASS_CLOTHES:
+            clothes = confidences[MULTICLASS_CLOTHES]
         sources.append("mediapipe-selfie-multiclass")
 
     if hair_segmenter_model_path:
@@ -308,11 +326,17 @@ def segment_head(
         )
 
     hair = np.maximum.reduce([_resize_probability(part, width, height) for part in hair_parts])
+
+    def resized(probability: np.ndarray | None) -> np.ndarray | None:
+        return None if probability is None else _resize_probability(probability, width, height)
+
     return HeadSegmentation(
         hair=hair,
-        face_skin=None if face_skin is None else _resize_probability(face_skin, width, height),
-        body_skin=None if body_skin is None else _resize_probability(body_skin, width, height),
+        face_skin=resized(face_skin),
+        body_skin=resized(body_skin),
         source="+".join(sources),
+        background=resized(background),
+        clothes=resized(clothes),
     )
 
 
@@ -538,6 +562,70 @@ def _fill_background(rgb: np.ndarray, head_region: np.ndarray, inpainter: Inpain
     return inpainter(rgb, hole).astype(np.float32)
 
 
+def _restore_body_silhouette(
+    background: np.ndarray,
+    rgb: np.ndarray,
+    background_region: np.ndarray,
+    segmentation: HeadSegmentation,
+    points: np.ndarray,
+    unit: float,
+) -> tuple[np.ndarray, int]:
+    """Long hair over the shoulders leaves a hole the inpainter fills with a haze of
+    background, clothes and hair colours. On a plain background (ID-style photos) the
+    answer is simple: above the shoulder line it is background, below it is clothes.
+    The hidden part of the shoulder line is interpolated from the columns where it is
+    visible; above it the background is rebuilt as a smooth field, below it the
+    inpainted clothes are kept."""
+
+    if segmentation.background is None or not background_region.any():
+        return background, 0
+    height, width = background_region.shape
+    hidden = _dilate(background_region, radius=0.01 * unit)
+    known_background = (segmentation.background > 0.8) & ~hidden
+    if known_background.sum() < 500:
+        return background, 0
+
+    rows, cols = np.nonzero(background_region)
+    margin = int(0.3 * unit)
+    window = (slice(max(0, rows.min() - margin), rows.max() + margin), slice(max(0, cols.min() - margin), cols.max() + margin))
+    nearby = (rgb[window] @ np.array([0.299, 0.587, 0.114], dtype=np.float32))[known_background[window]]
+    if nearby.size < 200:
+        return background, 0
+    if 1.4826 * float(np.median(np.abs(nearby - np.median(nearby)))) > PLAIN_BACKGROUND_MAX_SPREAD:
+        return background, 0
+
+    body = np.zeros_like(background_region)
+    for probability in (segmentation.clothes, segmentation.body_skin):
+        if probability is not None:
+            body |= probability > 0.5
+    jaw_y = int(max(points[JAW_LEFT_INDEX, 1], points[JAW_RIGHT_INDEX, 1]))
+    below_jaw = np.arange(height)[:, None] >= jaw_y
+    visible_body = body & ~hidden & below_jaw
+    has_body = visible_body.any(axis=0)
+    top = np.where(has_body, visible_body.argmax(axis=0), height)
+
+    # A column's shoulder line is known when visible background sits right above it, or
+    # when the column holds neither body nor removed hair (pure background).
+    columns = np.arange(width)
+    probe = np.clip(top - max(2, int(0.015 * unit)), 0, height - 1)
+    above_is_background = (segmentation.background[probe, columns] > 0.5) & ~hidden[probe, columns]
+    hidden_below = (background_region & below_jaw).any(axis=0)
+    known = (has_body & above_is_background) | (~has_body & ~hidden_below)
+    if known.sum() < 0.1 * width or not hidden_below.any():
+        return background, 0
+    shoulder = np.interp(columns, columns[known], top[known].astype(np.float32))
+
+    # Beside the face (above the jaw) removed hair outside the skull is always background
+    # in a frontal portrait; below the jaw only what lies above the shoulder line is.
+    rebuild = background_region & (np.arange(height)[:, None] < shoulder[None, :])
+    if not rebuild.any():
+        return background, 0
+    smooth = _push_pull(rgb, known_background.astype(np.float32))
+    alpha = np.clip(_blur(rebuild.astype(np.float32), max(1.0, 0.004 * unit)), 0.0, 1.0)
+    alpha = np.where(background_region, alpha, 0.0)[..., None]
+    return background * (1.0 - alpha) + smooth * alpha, int(rebuild.sum())
+
+
 def _rebuild_neck(
     background: np.ndarray,
     rgb: np.ndarray,
@@ -633,8 +721,36 @@ def _render_scalp(
     highlight = 0.02 * np.exp(-(du / 0.55) ** 2 - ((v - highlight_v) / (skull.radius_v * 0.35)) ** 2)
 
     dome = (base + du[..., None] * slope) * shade[..., None] + 255.0 * highlight[..., None]
+    dome *= (1.0 + _forehead_highlight(rgb, skin_samples, local_points, u, v, skull))[..., None]
     dome += _skin_grain(rgb, skin_samples, unit)[..., None]
     return dome
+
+
+def _forehead_highlight(
+    rgb: np.ndarray,
+    skin_samples: np.ndarray,
+    local_points: np.ndarray,
+    u: np.ndarray,
+    v: np.ndarray,
+    skull: _Skull,
+) -> np.ndarray:
+    """A real forehead catches the same light as the nose bridge and cheekbones, which
+    makes it read as a curved surface. Measure how shiny the user's face is and put a
+    matching soft highlight on the middle of the drawn forehead (0 for matte skin)."""
+
+    if skin_samples.sum() < 200:
+        return np.zeros_like(u)
+    luminance = rgb[skin_samples] @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    median = max(float(np.median(luminance)), 1.0)
+    shine = (float(np.percentile(luminance, 97)) - median) / median
+    strength = float(np.clip(FOREHEAD_HIGHLIGHT_SCALE * shine, 0.0, FOREHEAD_HIGHLIGHT_MAX))
+
+    forehead_v = float(local_points[FOREHEAD_TOP_INDEX, 1])
+    brow_top_v = float(min(local_points[LEFT_BROW_INDICES, 1].min(), local_points[RIGHT_BROW_INDICES, 1].min()))
+    center_v = forehead_v + 0.45 * (brow_top_v - forehead_v)
+    spread_u = 0.20 * skull.face_width
+    spread_v = 0.30 * max(brow_top_v - forehead_v, 0.05 * skull.face_height) + 0.04 * skull.face_height
+    return strength * np.exp(-(((u - skull.center_u) / spread_u) ** 2) - ((v - center_v) / spread_v) ** 2)
 
 
 def _skin_grain(rgb: np.ndarray, skin_samples: np.ndarray, unit: float) -> np.ndarray:
