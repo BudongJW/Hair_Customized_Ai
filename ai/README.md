@@ -7,6 +7,13 @@ thin-plate-spline alignment, pixel-preservation guarantees and the optional remo
 GPU refinement boundary. Use `AI_FITTING_MODE=prepare` to inspect inputs without a
 result, or `legacy` only to compare the older heuristic compositor.
 
+## Hair removal (bald canvas)
+
+See [HAIR_REMOVAL.md](HAIR_REMOVAL.md): skull-aware hair removal that fills hair outside the
+skull with background and hair inside it with shaded scalp skin, instead of painting the whole
+hair mask with skin colour ("mushroom head", leftover bangs). Not wired into `hair_transfer.py`
+yet. Try it on a photo with `python tools/hair_removal_demo.py`.
+
 FastAPI 기반 AI 처리 서버입니다. Spring Boot가 얼굴 프로필/피팅 작업 ID를 전달하면, worker가 S3 이미지를 읽고 처리 결과를 다시 S3와 DB에 저장합니다.
 
 ## 현재 AI 단계

@@ -9,6 +9,8 @@ load_dotenv()
 AI_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_FACE_LANDMARKER_MODEL_PATH = AI_ROOT / "models" / "face_landmarker.task"
 DEFAULT_HAIR_SEGMENTER_MODEL_PATH = AI_ROOT / "models" / "hair_segmenter.tflite"
+DEFAULT_SELFIE_MULTICLASS_MODEL_PATH = AI_ROOT / "models" / "selfie_multiclass_256x256.tflite"
+DEFAULT_LAMA_MODEL_PATH = AI_ROOT / "models" / "lama_fp32.onnx"
 
 
 @dataclass(frozen=True)
@@ -19,6 +21,8 @@ class Settings:
     face_landmarker_model_path: str
     hair_segmenter_model_path: str
     fitting_mode: str = "texture"
+    selfie_multiclass_model_path: str = str(DEFAULT_SELFIE_MULTICLASS_MODEL_PATH)
+    lama_model_path: str = str(DEFAULT_LAMA_MODEL_PATH)
 
 
 def get_settings() -> Settings:
@@ -38,4 +42,9 @@ def get_settings() -> Settings:
             str(DEFAULT_HAIR_SEGMENTER_MODEL_PATH),
         ),
         fitting_mode=fitting_mode,
+        selfie_multiclass_model_path=os.getenv(
+            "SELFIE_MULTICLASS_MODEL_PATH",
+            str(DEFAULT_SELFIE_MULTICLASS_MODEL_PATH),
+        ),
+        lama_model_path=os.getenv("LAMA_MODEL_PATH", str(DEFAULT_LAMA_MODEL_PATH)),
     )
