@@ -47,6 +47,10 @@ NOSE_INDICES = [168, 6, 197, 195, 5, 4, 1, 19, 94, 2, 98, 97, 326, 327, 64, 294,
 FOREHEAD_TOP_INDEX = 10
 CHIN_INDEX = 152
 NOSE_TIP_INDEX = 1
+JAW_LEFT_INDEX = 172
+JAW_RIGHT_INDEX = 397
+# Neck half-width relative to half the distance between the jaw angles.
+NECK_WIDTH_SCALE = 0.80
 
 # Skull model, expressed in face units (see _estimate_skull):
 #   width  = face-oval width * SKULL_WIDTH_SCALE
@@ -195,6 +199,9 @@ def remove_hair(
     background_region = removal & ~skull_mask
 
     background = _fill_background(rgb, skull_mask | removal, inpainter, unit)
+    background, neck_pixels = _rebuild_neck(
+        background, rgb, background_region, segmentation.body_skin, points, frame, local_grid, unit
+    )
 
     skin_probability = segmentation.face_skin
     if skin_probability is None:
@@ -234,6 +241,7 @@ def remove_hair(
         "removedPixelCount": int(removal.sum()),
         "scalpFillPixelCount": int(scalp_region.sum()),
         "backgroundFillPixelCount": int(background_region.sum()),
+        "rebuiltNeckPixelCount": neck_pixels,
         "redrawnEyebrows": brows_redrawn,
     }
     return HairRemovalResult(
@@ -521,6 +529,49 @@ def _fill_background(rgb: np.ndarray, head_region: np.ndarray, inpainter: Inpain
 
     hole = _dilate(head_region, radius=0.02 * unit)
     return inpainter(rgb, hole).astype(np.float32)
+
+
+def _rebuild_neck(
+    background: np.ndarray,
+    rgb: np.ndarray,
+    background_region: np.ndarray,
+    body_skin: np.ndarray | None,
+    points: np.ndarray,
+    frame: _FaceFrame,
+    local_grid: np.ndarray,
+    unit: float,
+) -> tuple[np.ndarray, int]:
+    """Long hair hanging beside the neck leaves a large hole that the inpainter smears into
+    a mix of neck, background and clothes. Inside a neck band below the jaw, continue the
+    visible neck skin instead, so the neck keeps a clean outline against the background."""
+
+    if body_skin is None:
+        return background, 0
+    local = frame.to_local(points)
+    left_u, right_u = float(local[JAW_LEFT_INDEX, 0]), float(local[JAW_RIGHT_INDEX, 0])
+    jaw_v = max(float(local[JAW_LEFT_INDEX, 1]), float(local[JAW_RIGHT_INDEX, 1]))
+    chin_v = float(local[CHIN_INDEX, 1])
+    center_u = (left_u + right_u) / 2.0
+    half_width = (right_u - left_u) / 2.0 * NECK_WIDTH_SCALE
+    u, v = local_grid[..., 0], local_grid[..., 1]
+    widening = 1.0 + np.clip((v - chin_v) / unit, 0.0, None) * 0.25
+    band = (v > jaw_v - 0.05 * unit) & (np.abs(u - center_u) < half_width * widening)
+
+    visible_neck = (body_skin > 0.6) & band & ~background_region
+    if visible_neck.sum() < 0.002 * unit * unit:
+        return background, 0
+    # The neck ends at the collar: no lower than the visible neck skin reaches.
+    neck_bottom_v = float(np.percentile(v[visible_neck], 99))
+    band &= v < neck_bottom_v + 0.02 * unit
+    hidden = background_region & band
+    if not hidden.any():
+        return background, 0
+
+    skin = _push_pull(rgb, visible_neck.astype(np.float32))
+    skin += _skin_grain(rgb, visible_neck, unit)[..., None]
+    alpha = np.clip(_blur(hidden.astype(np.float32), max(1.0, 0.008 * unit)), 0.0, 1.0)
+    alpha = np.where(band, alpha, 0.0)[..., None]
+    return background * (1.0 - alpha) + skin * alpha, int(hidden.sum())
 
 
 def _render_scalp(
