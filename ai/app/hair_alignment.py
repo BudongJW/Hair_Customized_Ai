@@ -99,6 +99,7 @@ class HairTransferResult:
     bald: HairRemovalResult
     warped_hair: Image.Image  # RGBA in target space
     reference_hair: Image.Image  # RGBA in reference space
+    edit_mask: Image.Image | None = None  # every user pixel this transfer changed
     metadata: dict = field(default_factory=dict)
 
     def artifacts(self) -> dict[str, tuple[str, bytes]]:
@@ -108,6 +109,10 @@ class HairTransferResult:
             "warped-hair-mask.png": ("image/png", _encode_png(self.warped_hair.getchannel("A"))),
             "hair-layer.png": ("image/png", _encode_png(self.reference_hair)),
             "hair-mask.png": ("image/png", _encode_png(self.reference_hair.getchannel("A"))),
+            # Names the result screen already shows as "기존 머리 영역 / 합성 수정 영역 / 얼굴 보호 영역".
+            "target-hair-mask.png": ("image/png", _encode_png(self.bald.hair_mask)),
+            "face-protection-mask.png": ("image/png", _encode_png(self.bald.protection_mask)),
+            **({"edit-mask.png": ("image/png", _encode_png(self.edit_mask))} if self.edit_mask is not None else {}),
             **self.bald.artifacts(),
         }
 
@@ -166,6 +171,7 @@ def transfer_hair(
     hair_rgb = np.clip(warped_rgb * exposure, 0.0, 255.0)
     canvas, back_hair_pixels = _fill_back_hair(canvas, hair_rgb, warped_alpha, target_skull, target_segmentation)
     result = _composite(canvas, hair_rgb, warped_alpha, target_skull.face_width)
+    changed = np.abs(result - target_rgb).max(axis=2) > 2.0
 
     warped_rgba = np.dstack([hair_rgb, warped_alpha * 255.0])
     reference_rgba = np.dstack([layer.rgb, layer.alpha * 255.0])
@@ -186,6 +192,7 @@ def transfer_hair(
         bald=bald,
         warped_hair=Image.fromarray(np.clip(warped_rgba + 0.5, 0, 255).astype(np.uint8), "RGBA"),
         reference_hair=Image.fromarray(np.clip(reference_rgba + 0.5, 0, 255).astype(np.uint8), "RGBA"),
+        edit_mask=Image.fromarray(changed.astype(np.uint8) * 255, "L"),
         metadata=metadata,
     )
 

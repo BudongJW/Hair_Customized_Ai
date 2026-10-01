@@ -27,8 +27,8 @@ class Settings:
 
 def get_settings() -> Settings:
     fitting_mode = os.getenv("AI_FITTING_MODE", "texture").strip().lower()
-    if fitting_mode not in {"texture", "prepare", "legacy"}:
-        raise ValueError("AI_FITTING_MODE must be texture, prepare, or legacy")
+    if fitting_mode not in {"texture", "prepare", "legacy", "skull"}:
+        raise ValueError("AI_FITTING_MODE must be texture, prepare, legacy, or skull")
     return Settings(
         aws_region=os.getenv("AWS_REGION", "ap-northeast-2"),
         bucket=os.getenv("APP_STORAGE_BUCKET", "hair-customized-ai-aaron-dev"),

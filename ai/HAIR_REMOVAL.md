@@ -108,7 +108,8 @@ result.metadata["warnings"]  # 예: REFERENCE_HAIR_CROPPED_TOP (헤어모델 머
 result.artifacts()           # result.png, warped-hair-layer.png, bald-canvas.png, ...
 ```
 
-데모: `python tools/hair_transfer_demo.py 내사진.jpg 헤어모델.jpg --out out/`
+데모: `python tools/hair_transfer_demo.py 내사진.jpg 헤어모델.jpg --out out/`, 또는 worker 실행 후
+http://localhost:8000/demo 에서 사진을 올려 확인. 앱에서는 `AI_FITTING_MODE=skull`로 사용.
 
 헤어모델 사진에서 머리가 위/옆으로 잘려 있으면 그 부분은 복원할 수 없어 일직선으로 잘린 모양이 됩니다.
 `warnings`로 감지하니, 앱에서 "머리 전체가 나온 사진"을 다시 요청하는 데 쓰면 됩니다.
