@@ -1,4 +1,4 @@
-# 머리 제거 (bald canvas) — `app/hair_removal.py`
+# 머리 제거와 새 머리 맞추기 — `app/hair_removal.py`, `app/hair_alignment.py`
 
 헤어 합성 전에 사용자 사진에서 기존 머리카락을 지우는 단계입니다. 결과 화면의
 "머리 제거 결과"(`bald-canvas.png`)에 해당합니다.
@@ -79,11 +79,45 @@ python -m unittest discover tests                            # 모델 없이 도
 
 데모 패널의 마스크: 빨강 = 배경으로 채운 영역, 초록 = 두피로 채운 영역, 파랑 = 보호 영역, 노란 선 = 추정 두개골.
 
+## 2단계: 새 머리 맞추기 — `app/hair_alignment.py`
+
+머리를 지운 뒤 헤어모델의 머리를 올리는 단계입니다. 레거시 합성기는 잘라낸 머리를 얼굴 폭 비율로만
+키워서 이마에 붙이기 때문에, 새 머리가 작은 모자처럼 떠서 두피가 드러나곤 했습니다.
+
+1. **헤어모델 머리 추출**: 1단계와 같은 세그멘테이션으로 부드러운 머리 마스크(alpha)를 만들고,
+   머리 가장자리에 섞인 배경색을 걷어냄(밝은 배경의 흰 테두리 방지). 헤어라인 쪽 경계는 살짝 흐리게.
+2. **두개골 기준 정렬**: 헤어모델과 사용자 각각의 두개골 곡선 + 이마·관자놀이 윤곽 + 눈꼬리 + 턱
+   (31개 대응점)을 thin-plate spline으로 맞춤. 헤어모델의 두피 경계가 사용자의 두피 경계에 정확히 놓이고,
+   바깥 머리 볼륨은 그 비율대로 따라감. 변형이 뒤집히면 affine으로 대체.
+3. **합성**: bald canvas 위에 올리고, 머리 아래 약한 그림자, 노출 차이 보정(색상은 유지),
+   단발처럼 머리와 볼 사이에 생기는 좁은 틈은 어두운 뒷머리 색으로 채움.
+
+```python
+from app.hair_alignment import transfer_hair
+
+result = transfer_hair(user_portrait, user_landmarks, model_portrait, model_landmarks,
+                       hair_segmenter_model_path=..., multiclass_model_path=...,
+                       inpainter=default_inpainter(settings.lama_model_path))
+result.image                 # 최종 합성
+result.metadata["warnings"]  # 예: REFERENCE_HAIR_CROPPED_TOP (헤어모델 머리가 사진 밖으로 잘림)
+result.artifacts()           # result.png, warped-hair-layer.png, bald-canvas.png, ...
+```
+
+데모: `python tools/hair_transfer_demo.py 내사진.jpg 헤어모델.jpg --out out/`
+
+헤어모델 사진에서 머리가 위/옆으로 잘려 있으면 그 부분은 복원할 수 없어 일직선으로 잘린 모양이 됩니다.
+`warnings`로 감지하니, 앱에서 "머리 전체가 나온 사진"을 다시 요청하는 데 쓰면 됩니다.
+
 ## 한계와 다음 단계
 
 - 머리카락에 가려졌던 **귀·목·어깨**는 실제로 복원할 수 없음(LaMa가 추정). 긴 머리 → 짧은 머리 합성에서 티가 남.
 - 정면 사진 기준. 고개를 많이 돌린 사진은 두개골 추정 오차가 커짐.
-- 두피는 절차적으로 그린 것이라 사진 수준의 사실감은 아님. 더 자연스럽게 하려면 GPU 생성 모델이 필요:
+- 두피는 절차적으로 그린 것이라 사진 수준의 사실감은 아님. 새 헤어라인 아래로 보이는 이마가 얼굴보다
+  평평하고 약간 밝게 보임(LaMa로 이마를 다시 채우는 방법도 시험했지만 차이가 거의 없었음).
+- 긴 머리를 짧은 머리로 바꾸면 목·어깨 주변의 복원이 뭉개짐.
+- Gemini 무료 키로는 이미지 생성·편집이 불가(이미지 출력 모델은 모두 유료 전용). 아래 생성 모델 방식에
+  Gemini를 쓰려면 유료 등급이 필요하고, 사용자 얼굴 사진이 외부로 전송되는 점도 고려해야 함.
+- 더 자연스럽게 하려면 생성 모델이 필요:
   - Stable Diffusion inpainting(“bald head” 프롬프트)이나 Stable-Hair의 bald converter에
     이 모듈의 `skull_mask` / `removal_mask`를 inpainting 마스크로 넘기는 방식이 가장 현실적.
   - 또는 HairFastGAN처럼 bald 단계 없이 latent 공간에서 헤어를 바꾸는 방식.
