@@ -17,8 +17,8 @@ from fastapi.responses import HTMLResponse
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, Field
 
-from .config import get_settings
-from .skull_fitting import FaceNotFoundError, run_skull_transfer
+from .config import GENERATIVE_REFINE_MODES, get_settings
+from .skull_fitting import FaceNotFoundError, GenerativeRefineUnavailableError, run_skull_transfer
 
 router = APIRouter()
 
@@ -28,6 +28,9 @@ MAX_IMAGE_BYTES = 12 * 1024 * 1024
 class DemoTransferRequest(BaseModel):
     user_photo: str = Field(alias="userPhoto", description="data URL or base64 of the user's face photo")
     hair_model_photo: str = Field(alias="hairModelPhoto", description="data URL or base64 of the hair model photo")
+    refine: str | None = Field(
+        default=None, description="generative touch-up: off, fast or quality (default: AI_GENERATIVE_REFINE)"
+    )
 
 
 @router.get("/demo", response_class=HTMLResponse, include_in_schema=False)
@@ -39,11 +42,17 @@ def demo_page() -> str:
 def demo_hair_transfer(request: DemoTransferRequest) -> dict:
     face_bytes = _decode(request.user_photo, "내 얼굴 사진")
     reference_bytes = _decode(request.hair_model_photo, "헤어모델 사진")
+    if request.refine is not None and request.refine not in GENERATIVE_REFINE_MODES:
+        raise HTTPException(status_code=422, detail="refine은 off, fast, quality 중 하나여야 합니다.")
     started = time.perf_counter()
     try:
-        result = run_skull_transfer(face_bytes, reference_bytes, get_settings())
+        result = run_skull_transfer(
+            face_bytes, reference_bytes, get_settings(), refine=request.refine, require_refine=request.refine is not None
+        )
     except FaceNotFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except GenerativeRefineUnavailableError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except UnidentifiedImageError as exc:
         raise HTTPException(status_code=422, detail="이미지 파일을 읽지 못했습니다. JPG나 PNG 사진을 사용해 주세요.") from exc
     except ValueError as exc:
@@ -55,6 +64,8 @@ def demo_hair_transfer(request: DemoTransferRequest) -> dict:
         "result": _data_url(result.image),
         "baldCanvas": _data_url(result.bald.image),
         "warpedHair": _data_url(hair_preview),
+        "unrefined": _data_url(result.unrefined_image) if result.unrefined_image is not None else None,
+        "generativeRefine": result.metadata.get("generativeRefine"),
         "warnings": result.metadata.get("warnings", []),
         "elapsedSeconds": round(time.perf_counter() - started, 2),
         "warp": result.metadata.get("warp", {}),
@@ -95,6 +106,8 @@ DEMO_PAGE = """<!doctype html>
   .inputs, .outputs { display: grid; gap: 12px; }
   .inputs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .outputs { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 20px; }
+  .options { margin-top: 16px; font-size: 14px; color: var(--muted); }
+  .options select { margin-left: 6px; font-size: 14px; padding: 4px 6px; }
   .card { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 12px; }
   .card h2 { font-size: 13px; margin: 0 0 8px; color: var(--muted); }
   .frame { aspect-ratio: 4 / 5; background: #eef2f6; border-radius: 8px; overflow: hidden;
@@ -119,19 +132,29 @@ DEMO_PAGE = """<!doctype html>
     <div class="card"><h2>헤어모델 사진</h2><div class="frame" id="modelPreview">사진을 선택하세요</div>
       <input type="file" id="modelPhoto" accept="image/*"></div>
   </div>
+  <div class="options"><label>생성형 보정
+    <select id="refine">
+      <option value="off">끄기 (약 10초)</option>
+      <option value="fast">빠르게 (CPU 약 1분)</option>
+      <option value="quality">고품질 (CPU 약 3분)</option>
+    </select></label></div>
   <button id="run" disabled>합성하기</button>
   <div id="status"></div>
   <div class="outputs">
     <div class="card"><h2>합성 결과</h2><div class="frame" id="result"></div></div>
     <div class="card"><h2>머리 제거 결과</h2><div class="frame" id="bald"></div></div>
     <div class="card"><h2>맞춘 새 머리</h2><div class="frame" id="hair"></div></div>
+    <div class="card" id="unrefinedCard" hidden><h2>생성형 보정 전</h2><div class="frame" id="unrefined"></div></div>
   </div>
 </main>
 <script>
 const photos = {};
 const WARNINGS = { REFERENCE_HAIR_CROPPED_TOP: "헤어모델 사진에서 머리 윗부분이 잘려 있어 정수리가 평평하게 보일 수 있습니다.",
                    REFERENCE_HAIR_CROPPED_LEFT: "헤어모델 사진에서 머리 왼쪽이 잘려 있습니다.",
-                   REFERENCE_HAIR_CROPPED_RIGHT: "헤어모델 사진에서 머리 오른쪽이 잘려 있습니다." };
+                   REFERENCE_HAIR_CROPPED_RIGHT: "헤어모델 사진에서 머리 오른쪽이 잘려 있습니다.",
+                   GENERATIVE_REFINE_UNAVAILABLE: "생성형 보정 패키지가 없어 보정 없이 합성했습니다.",
+                   REFERENCE_FACE_TURNED: "헤어모델이 고개를 돌린 사진이라 머리 모양이 한쪽으로 치우칠 수 있습니다. 정면 사진을 쓰면 더 정확합니다.",
+                   USER_FACE_TURNED: "내 얼굴 사진이 정면이 아니라 두상 추정이 부정확할 수 있습니다." };
 function show(id, src) { document.getElementById(id).innerHTML = src ? '<img alt="" src="' + src + '">' : ""; }
 function shrink(file) {
   return new Promise((resolve, reject) => {
@@ -159,13 +182,16 @@ for (const [inputId, previewId, key] of [["userPhoto", "userPreview", "user"], [
 }
 document.getElementById("run").addEventListener("click", async () => {
   const button = document.getElementById("run"), status = document.getElementById("status");
-  button.disabled = true; status.className = ""; status.textContent = "합성 중입니다… (보통 10초 내외)";
+  const refine = document.getElementById("refine").value;
+  button.disabled = true; status.className = "";
+  status.textContent = refine === "off" ? "합성 중입니다… (보통 10초 내외)" : "합성과 생성형 보정 중입니다… (CPU에서는 1~3분, 첫 실행은 모델 다운로드로 더 걸립니다)";
   try {
     const response = await fetch("/api/v1/demo/hair-transfer", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ userPhoto: photos.user, hairModelPhoto: photos.model }) });
+      body: JSON.stringify({ userPhoto: photos.user, hairModelPhoto: photos.model, refine }) });
     const body = await response.json();
     if (!response.ok) throw new Error(typeof body.detail === "string" ? body.detail : "처리하지 못했습니다.");
     show("result", body.result); show("bald", body.baldCanvas); show("hair", body.warpedHair);
+    show("unrefined", body.unrefined); document.getElementById("unrefinedCard").hidden = !body.unrefined;
     const notes = body.warnings.map((w) => WARNINGS[w] || w);
     status.textContent = "완료 (" + body.elapsedSeconds + "초)" + (notes.length ? " · " + notes.join(" ") : "");
   } catch (error) {

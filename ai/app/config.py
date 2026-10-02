@@ -11,6 +11,10 @@ DEFAULT_FACE_LANDMARKER_MODEL_PATH = AI_ROOT / "models" / "face_landmarker.task"
 DEFAULT_HAIR_SEGMENTER_MODEL_PATH = AI_ROOT / "models" / "hair_segmenter.tflite"
 DEFAULT_SELFIE_MULTICLASS_MODEL_PATH = AI_ROOT / "models" / "selfie_multiclass_256x256.tflite"
 DEFAULT_LAMA_MODEL_PATH = AI_ROOT / "models" / "lama_fp32.onnx"
+# Photorealistic SD 1.5 inpainting fine-tune (CreativeML OpenRAIL-M). The base
+# "stable-diffusion-v1-5/stable-diffusion-inpainting" also works but draws flatter skin.
+DEFAULT_GENERATIVE_MODEL = "Lykon/absolute-reality-1.6525-inpainting"
+GENERATIVE_REFINE_MODES = ("off", "fast", "quality")
 
 
 @dataclass(frozen=True)
@@ -23,12 +27,18 @@ class Settings:
     fitting_mode: str = "texture"
     selfie_multiclass_model_path: str = str(DEFAULT_SELFIE_MULTICLASS_MODEL_PATH)
     lama_model_path: str = str(DEFAULT_LAMA_MODEL_PATH)
+    generative_refine: str = "off"
+    generative_model: str = DEFAULT_GENERATIVE_MODEL
+    generative_device: str = "auto"
 
 
 def get_settings() -> Settings:
     fitting_mode = os.getenv("AI_FITTING_MODE", "texture").strip().lower()
     if fitting_mode not in {"texture", "prepare", "legacy", "skull"}:
         raise ValueError("AI_FITTING_MODE must be texture, prepare, legacy, or skull")
+    generative_refine = os.getenv("AI_GENERATIVE_REFINE", "off").strip().lower()
+    if generative_refine not in GENERATIVE_REFINE_MODES:
+        raise ValueError("AI_GENERATIVE_REFINE must be off, fast, or quality")
     return Settings(
         aws_region=os.getenv("AWS_REGION", "ap-northeast-2"),
         bucket=os.getenv("APP_STORAGE_BUCKET", "hair-customized-ai-aaron-dev"),
@@ -47,4 +57,7 @@ def get_settings() -> Settings:
             str(DEFAULT_SELFIE_MULTICLASS_MODEL_PATH),
         ),
         lama_model_path=os.getenv("LAMA_MODEL_PATH", str(DEFAULT_LAMA_MODEL_PATH)),
+        generative_refine=generative_refine,
+        generative_model=os.getenv("AI_GENERATIVE_MODEL", DEFAULT_GENERATIVE_MODEL),
+        generative_device=os.getenv("AI_GENERATIVE_DEVICE", "auto").strip().lower(),
     )

@@ -3,8 +3,9 @@
 Usage (from the ``ai`` directory)::
 
     python tools/hair_transfer_demo.py user.jpg hair_model.jpg --out out/
+    python tools/hair_transfer_demo.py user.jpg hair_model.jpg --refine fast   # + generative touch-up
 
-Panel: user photo | hair model | result | bald canvas | warped hair layer.
+Panel: user photo | hair model | result | bald canvas | warped hair layer (| result before touch-up).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ sys.path.insert(0, str(AI_ROOT))
 
 from app.config import get_settings  # noqa: E402
 from app.face_landmarker import analyze_with_mediapipe  # noqa: E402
+from app.generative_refine import PRESETS, DiffusionInpainter, refine_transfer  # noqa: E402
 from app.hair_alignment import transfer_hair  # noqa: E402
 from app.hair_removal import default_inpainter, push_pull_inpaint  # noqa: E402
 
@@ -33,6 +35,7 @@ def main() -> None:
     parser.add_argument("hair_model_photo")
     parser.add_argument("--out", default="out")
     parser.add_argument("--no-lama", action="store_true", help="use the push-pull fallback instead of LaMa")
+    parser.add_argument("--refine", choices=sorted(PRESETS), help="generative touch-up (needs requirements-generative.txt)")
     args = parser.parse_args()
 
     settings = get_settings()
@@ -55,13 +58,20 @@ def main() -> None:
         hair_segmenter_model_path=settings.hair_segmenter_model_path,
         multiclass_model_path=settings.selfie_multiclass_model_path,
         inpainter=push_pull_inpaint if args.no_lama else default_inpainter(settings.lama_model_path),
+        headroom=True,
     )
+    if args.refine:
+        refiner = DiffusionInpainter(preset=args.refine, model=settings.generative_model, device=settings.generative_device)
+        result = refine_transfer(result, refiner, preset=args.refine)
     elapsed = time.perf_counter() - started
 
     hair_preview = Image.new("RGB", result.warped_hair.size, (255, 255, 255))
     hair_preview.paste(result.warped_hair, mask=result.warped_hair.getchannel("A"))
     name = f"{Path(args.user_photo).stem}__{Path(args.hair_model_photo).stem}"
-    _panel([user, hair_model, result.image, result.bald.image, hair_preview]).save(out_dir / f"{name}_panel.jpg", quality=90)
+    panels = [user, hair_model, result.image, result.bald.image, hair_preview]
+    if result.unrefined_image is not None:
+        panels.append(result.unrefined_image)
+    _panel(panels).save(out_dir / f"{name}_panel.jpg", quality=90)
     result.image.save(out_dir / f"{name}_result.png")
     print(f"{name}: {elapsed:.2f}s warp={result.metadata['warp']} warnings={result.metadata['warnings']}")
 
@@ -69,7 +79,7 @@ def main() -> None:
 def _panel(images: list[Image.Image]) -> Image.Image:
     width = 300
     height = int(width * images[0].height / images[0].width)
-    labels = ["user photo", "hair model", "result", "bald canvas", "warped hair"]
+    labels = ["user photo", "hair model", "result", "bald canvas", "warped hair", "before touch-up"]
     sheet = Image.new("RGB", (width * len(images), height + 24), "white")
     draw = ImageDraw.Draw(sheet)
     for index, image in enumerate(images):

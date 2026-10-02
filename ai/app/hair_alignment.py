@@ -63,6 +63,12 @@ RIGHT_FACE_EDGE_INDEX = 454
 NEUTRAL_BACKDROP_MAX_TINT = 0.12
 WHITE_BALANCE_STRENGTH = 0.7
 WHITE_BALANCE_MAX_SHIFT = 0.12
+# Headroom: backdrop kept above the new hair (face widths), and at most this fraction of the
+# photo height is given up at the bottom to make room for it.
+HEADROOM_MARGIN = 0.05
+MAX_HEADROOM_SHIFT = 0.25
+# Warped hair further than this (face widths) from the hair on the head is dropped.
+STRAY_HAIR_DISTANCE = 0.05
 METADATA_VERSION = "hair-transfer-v3-skull-tps"
 
 
@@ -106,6 +112,8 @@ class HairTransferResult:
     reference_hair: Image.Image  # RGBA in reference space
     edit_mask: Image.Image | None = None  # every user pixel this transfer changed
     metadata: dict = field(default_factory=dict)
+    unrefined_image: Image.Image | None = None  # the result before generative_refine, if it ran
+    target_points: np.ndarray | None = None  # user landmarks in result pixels (moved by headroom)
 
     def artifacts(self) -> dict[str, tuple[str, bytes]]:
         return {
@@ -118,6 +126,11 @@ class HairTransferResult:
             "target-hair-mask.png": ("image/png", _encode_png(self.bald.hair_mask)),
             "face-protection-mask.png": ("image/png", _encode_png(self.bald.protection_mask)),
             **({"edit-mask.png": ("image/png", _encode_png(self.edit_mask))} if self.edit_mask is not None else {}),
+            **(
+                {"unrefined-result.png": ("image/png", _encode_png(self.unrefined_image))}
+                if self.unrefined_image is not None
+                else {}
+            ),
             **self.bald.artifacts(),
         }
 
@@ -133,10 +146,13 @@ def transfer_hair(
     hair_segmenter_model_path: str | None = None,
     multiclass_model_path: str | None = None,
     inpainter: Inpainter | None = None,
+    headroom: bool = False,
 ) -> HairTransferResult:
     """Put the reference hairstyle on the target person.
 
-    Both images must be the ones their landmarks were computed on (same crop and size).
+    Each image must be the one its landmarks were computed on; the two may differ in size.
+    With ``headroom``, a target photo framed too tight for the new hairstyle is moved down
+    (see ``add_headroom``) so the hair is not cut off by the top of the photo.
     """
 
     if inpainter is None:
@@ -150,14 +166,21 @@ def transfer_hair(
             reference, hair_segmenter_model_path=hair_segmenter_model_path, multiclass_model_path=multiclass_model_path
         )
 
-    bald = remove_hair(target, target_landmarks, segmentation=target_segmentation, inpainter=inpainter)
     layer = extract_hair_layer(reference, reference_landmarks, reference_segmentation)
-
     width, height = target.size
     target_points = _landmark_pixels(target_landmarks, width, height)
+    target_skull = _estimate_skull(_face_frame(target_points), target_points, target_segmentation)
+    headroom_rows = required_headroom(layer, target_points, target_skull, (width, height)) if headroom else 0
+    if headroom_rows:
+        target, target_landmarks = add_headroom(target, target_landmarks, headroom_rows, target_segmentation.hair > 0.3)
+        target_segmentation = _shift_segmentation(target_segmentation, headroom_rows)
+        target_points = _landmark_pixels(target_landmarks, width, height)
+        target_skull = _estimate_skull(_face_frame(target_points), target_points, target_segmentation)
+
+    bald = remove_hair(target, target_landmarks, segmentation=target_segmentation, inpainter=inpainter)
     target_frame = _face_frame(target_points)
-    target_skull = _estimate_skull(target_frame, target_points, target_segmentation)
     warped_rgb, warped_alpha, warp = align_hair_layer(layer, target_points, target_skull, (width, height))
+    warped_alpha, stray_pixels = _drop_stray_hair(warped_alpha, target_skull)
 
     canvas = np.asarray(bald.image, dtype=np.float32)
     target_rgb = np.asarray(target.convert("RGB"), dtype=np.float32)
@@ -192,6 +215,8 @@ def transfer_hair(
         "backHairPixelCount": back_hair_pixels,
         "lentSkinTexturePixelCount": forehead_pixels,
         "lentEarPixelCount": ear_pixels,
+        "headroomRows": headroom_rows,
+        "strayHairPixelCount": stray_pixels,
         "referenceSkull": {"radiusU": layer.skull.radius_u, "radiusV": layer.skull.radius_v},
         "targetSkull": {"radiusU": target_skull.radius_u, "radiusV": target_skull.radius_v},
     }
@@ -202,6 +227,84 @@ def transfer_hair(
         reference_hair=Image.fromarray(np.clip(reference_rgba + 0.5, 0, 255).astype(np.uint8), "RGBA"),
         edit_mask=Image.fromarray(changed.astype(np.uint8) * 255, "L"),
         metadata=metadata,
+        target_points=target_points,
+    )
+
+
+def required_headroom(layer: HairLayer, target_points: np.ndarray, target_skull: _Skull, size: tuple[int, int]) -> int:
+    """Rows of backdrop the user photo lacks above the head for the new hairstyle.
+
+    ID photos are framed tight: a taller style than the user's own would be cut off by the
+    top of the photo. The hair is warped onto a canvas extended upwards to see where its
+    top lands.
+    """
+
+    width, height = size
+    probe = int(MAX_HEADROOM_SHIFT * height)
+    forehead_y = float(target_points[FOREHEAD_TOP_INDEX, 1])
+    canvas_height = int(probe + max(forehead_y, 1.0))  # nothing of interest below the forehead
+    lowered = target_points + np.array([0.0, probe], dtype=np.float32)
+    _rgb, alpha, _warp = align_hair_layer(layer, lowered, target_skull, (width, canvas_height))
+    hair_rows = np.nonzero((alpha > 0.5).sum(axis=1) > max(3, 0.01 * width))[0]
+    if not len(hair_rows):
+        return 0
+    top = float(hair_rows[0]) - probe
+    margin = HEADROOM_MARGIN * target_skull.face_width
+    return int(np.clip(np.ceil(margin - top), 0, probe))
+
+
+def add_headroom(
+    image: Image.Image,
+    landmarks: Sequence[dict] | Sequence[Sequence[float]] | np.ndarray,
+    rows: int,
+    hair: np.ndarray | None = None,
+) -> tuple[Image.Image, list]:
+    """Move the photo down by ``rows`` (dropping the bottom rows) and continue the backdrop
+    into the strip that opens at the top. ``hair`` (the user's own hair) is kept out of the
+    fill so it does not grow upwards. Returns the new photo and its landmarks."""
+
+    width, height = image.size
+    rgb = np.asarray(image.convert("RGB"), dtype=np.float32)
+    shifted = np.zeros_like(rgb)
+    shifted[rows:] = rgb[: height - rows]
+    # Continue the backdrop seen in a band just below the strip (not the face further down).
+    known = np.zeros((height, width), dtype=bool)
+    known[rows : rows + max(8, height // 20)] = True
+    if hair is not None:
+        moved = np.zeros_like(known)
+        moved[rows:] = hair[: height - rows]
+        known &= ~_dilate(moved, radius=max(2.0, 0.01 * width))
+    if known.sum() < 50:  # hair across the whole top edge: use whatever is there
+        known = np.zeros_like(known)
+        known[rows:] = True
+    # A smooth fill, not LaMa: with nothing above the strip LaMa paints dark noise there,
+    # and ID photo backdrops are plain anyway.
+    filled = push_pull_inpaint(shifted, ~known)
+    shifted[:rows] = filled[:rows]
+
+    points = _landmark_pixels(landmarks, width, height)
+    points[:, 1] += rows
+    moved_landmarks = [
+        {"index": index, "x": float(x / width), "y": float(y / height)} for index, (x, y) in enumerate(points)
+    ]
+    return Image.fromarray(np.clip(shifted + 0.5, 0, 255).astype(np.uint8), "RGB"), moved_landmarks
+
+
+def _shift_segmentation(segmentation: HeadSegmentation, rows: int) -> HeadSegmentation:
+    def shift(probability: np.ndarray | None, fill: float) -> np.ndarray | None:
+        if probability is None:
+            return None
+        moved = np.full_like(probability, fill)
+        moved[rows:] = probability[: probability.shape[0] - rows]
+        return moved
+
+    return HeadSegmentation(
+        hair=shift(segmentation.hair, 0.0),
+        face_skin=shift(segmentation.face_skin, 0.0),
+        body_skin=shift(segmentation.body_skin, 0.0),
+        source=segmentation.source,
+        background=shift(segmentation.background, 1.0),
+        clothes=shift(segmentation.clothes, 0.0),
     )
 
 
@@ -413,6 +516,25 @@ def _exposure_match(
     return float(np.clip(np.sqrt(ratio), 0.8, 1.25))
 
 
+def _drop_stray_hair(alpha: np.ndarray, skull: _Skull) -> tuple[np.ndarray, int]:
+    """Pieces of the warped hair that land away from the head would float on the face or
+    neck: hair behind the far ear of a hair model who turned their head, or a stray
+    segmentation blob. Keep the hair connected to what covers the skull and anything near it."""
+
+    core = alpha > 0.5
+    height, width = alpha.shape
+    main = _connected_to(core, core & _rasterize(skull.polygon, (width, height)))
+    if not main.any():
+        return alpha, 0
+    near = _dilate(main, radius=STRAY_HAIR_DISTANCE * skull.face_width)
+    stray = core & ~near
+    if not stray.any():
+        return alpha, 0
+    cleaned = alpha.copy()
+    cleaned[_dilate(stray, radius=max(2.0, 0.01 * skull.face_width)) & ~near] = 0.0
+    return cleaned, int(stray.sum())
+
+
 def _fade_hairline(alpha: np.ndarray, scalp_fill: np.ndarray, unit: float) -> np.ndarray:
     """Where the new hair ends on the drawn forehead, thin it out over a few millimetres
     instead of ending on a cut-out edge (full-image generators get this for free)."""
@@ -589,6 +711,9 @@ def _fill_back_hair(
         if probability is not None:
             skin |= probability > 0.4
     gap = closed & ~core & ~head & ~_dilate(skin, radius=0.01 * unit)
+    # Above the crown there is only backdrop; there the closing would just bridge the
+    # hair to the top edge of a tightly framed photo.
+    gap[: max(0, int(skull.polygon[:, 1].min()))] = False
     if not gap.any():
         return canvas, 0
 

@@ -107,6 +107,88 @@ class TransferTest(unittest.TestCase):
             self.assertTrue(artifacts[name][1].startswith(b"\x89PNG"), name)
 
 
+class FramingTest(unittest.TestCase):
+    """Tight ID-photo framing, hair model photos of another size, stray hair pieces."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.image, cls.landmarks, cls.segmentation, cls.points, cls.hair_mask = _synthetic_portrait()
+        # The same haircut seen whole (the fixture's own photo cuts it off at the top).
+        cls.reference, cls.reference_landmarks, cls.reference_segmentation = _scaled(
+            cls.image, cls.landmarks, cls.segmentation, 0.75
+        )
+
+    def _transfer(self, reference, reference_landmarks, reference_segmentation, **options):
+        return transfer_hair(
+            self.image,
+            self.landmarks,
+            reference,
+            reference_landmarks,
+            target_segmentation=self.segmentation,
+            reference_segmentation=reference_segmentation,
+            inpainter=push_pull_inpaint,
+            **options,
+        )
+
+    def test_tight_photo_is_moved_down_so_the_hair_fits(self):
+        result = self._transfer(self.reference, self.reference_landmarks, self.reference_segmentation, headroom=True)
+        rows = result.metadata["headroomRows"]
+        self.assertGreater(rows, 0)
+        self.assertEqual(result.image.size, self.image.size)
+        alpha = np.asarray(result.warped_hair.getchannel("A"))
+        self.assertFalse((alpha[:3] > 127).any(), "hair still runs into the top edge")
+        output = np.asarray(result.image, dtype=np.float32)
+        error = np.abs(output[:3] - np.array(BACKGROUND)).max(axis=2)
+        self.assertLess(float(np.percentile(error, 95)), 8.0, "the opened strip should be backdrop")
+        np.testing.assert_allclose(result.target_points[:, 1] - self.points[:, 1], rows, atol=1e-3)
+        np.testing.assert_allclose(result.target_points[:, 0], self.points[:, 0], atol=1e-3)
+
+    def test_headroom_is_off_by_default(self):
+        result = self._transfer(self.reference, self.reference_landmarks, self.reference_segmentation)
+        self.assertEqual(result.metadata["headroomRows"], 0)
+        np.testing.assert_allclose(result.target_points, self.points, atol=1e-3)
+
+    def test_hair_model_photo_may_have_another_size(self):
+        # The worker no longer crops the hair model photo to the portrait frame.
+        width, height = self.reference.size
+        offset = (width // 5, height // 3)
+        canvas = Image.new("RGB", (width + 2 * offset[0], height + offset[1]), BACKGROUND)
+        canvas.paste(self.reference, offset)
+
+        def moved(probability):
+            out = np.zeros((canvas.height, canvas.width), dtype=np.float32)
+            out[offset[1] : offset[1] + height, offset[0] : offset[0] + width] = probability
+            return out
+
+        landmarks = [
+            [(x * width + offset[0]) / canvas.width, (y * height + offset[1]) / canvas.height]
+            for x, y in self.reference_landmarks
+        ]
+        segmentation = HeadSegmentation(
+            hair=moved(self.reference_segmentation.hair), face_skin=moved(self.reference_segmentation.face_skin)
+        )
+        larger = self._transfer(canvas, landmarks, segmentation)
+        same = self._transfer(self.reference, self.reference_landmarks, self.reference_segmentation)
+        first = np.asarray(larger.warped_hair.getchannel("A")) > 127
+        second = np.asarray(same.warped_hair.getchannel("A")) > 127
+        self.assertGreater(_iou(first, second), 0.95)
+
+    def test_stray_hair_far_from_the_head_is_dropped(self):
+        result = self._transfer(self.reference, self.reference_landmarks, self.reference_segmentation)
+        frame = ha._face_frame(self.points)
+        skull = ha._estimate_skull(frame, self.points, self.segmentation)
+        alpha = np.asarray(result.warped_hair.getchannel("A"), dtype=np.float32) / 255.0
+        unit = skull.face_width
+        chin = self.points[152]
+        island = alpha.copy()
+        y, x = int(chin[1] + 0.05 * unit), int(chin[0] + 0.45 * unit)
+        island[y : y + 12, x : x + 12] = 1.0
+        cleaned, dropped = ha._drop_stray_hair(island, skull)
+        self.assertGreaterEqual(dropped, 144)
+        self.assertEqual(float(cleaned[y : y + 12, x : x + 12].max()), 0.0)
+        np.testing.assert_array_equal(cleaned[alpha > 0.5], alpha[alpha > 0.5])
+
+
 class LendingTest(unittest.TestCase):
     """The hair model's photo can show what the user's photo hides (ears, forehead skin)."""
 

@@ -18,6 +18,10 @@ AI worker를 실행한 뒤(`scripts/run-ai.ps1`) 브라우저에서 http://local
 `app/hair_transfer.py`가 없는 체크아웃에서는 `texture`/`prepare` 모드가 명확한 오류로 실패하고,
 `skull`/`legacy` 모드는 동작합니다.
 
+생성형 보정(선택): `pip install -r requirements-generative.txt` 후 `AI_GENERATIVE_REFINE=fast`(또는 `quality`)를
+넣으면, 절차적으로 그린 이마·헤어라인·목 부분만 Stable Diffusion inpainting으로 사진처럼 다시 그립니다.
+눈·코·입과 옮겨 온 머리카락은 그대로입니다. 자세한 내용은 [HAIR_REMOVAL.md](HAIR_REMOVAL.md#생성형-보정-선택--appgenerative_refinepy).
+
 ## Hair removal and hair alignment
 
 See [HAIR_REMOVAL.md](HAIR_REMOVAL.md): skull-aware hair removal that fills hair outside the
@@ -39,7 +43,7 @@ FastAPI 기반 AI 처리 서버입니다. Spring Boot가 얼굴 프로필/피팅
 6. 헤어모델의 헤어 crop 내부 anchor를 사용자 이마 anchor에 맞추고, 모델-사용자 기울기 차이만큼 회전 보정합니다.
 7. 분리된 헤어레이어를 내 얼굴 사진 위에 합성합니다.
 
-현재 단계는 MediaPipe의 공식 HairSegmenter와 Face Landmarker를 함께 사용합니다. 생성형 합성 모델은 아직 붙지 않았고, segmentation mask와 landmark-based transform을 조합하는 방식입니다.
+현재 단계는 MediaPipe의 공식 HairSegmenter와 Face Landmarker를 함께 사용합니다. 기본은 segmentation mask와 landmark-based transform을 조합하는 방식이고, `AI_GENERATIVE_REFINE`을 켜면 skull 모드 결과의 합성 부분만 생성 모델로 다듬습니다.
 
 ## 실행
 
