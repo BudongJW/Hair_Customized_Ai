@@ -308,6 +308,58 @@ class WhiteBalanceTest(unittest.TestCase):
         np.testing.assert_allclose(ha._white_balance_gain(black, black_segmentation, neutral, neutral_segmentation), 1.0)
 
 
+class PoseTest(unittest.TestCase):
+    """Hair model photos with the head turned (common for celebrity photos)."""
+
+    @classmethod
+    def setUpClass(cls):
+        image, landmarks, segmentation, points, _hair = _synthetic_portrait()
+        cls.size = image.size
+        cls.points, cls.segmentation = points, segmentation
+        oval = points[FACE_OVAL_INDICES]
+        cls.center_x = float(oval[:, 0].mean())
+        half = float(oval[:, 0].max() - oval[:, 0].min()) / 2.0
+        # A face surface bulging towards the camera (MediaPipe: smaller z is closer).
+        depth = -np.sqrt(np.clip(half**2 - (points[:, 0] - cls.center_x) ** 2, 0.0, None)) + 0.6 * half
+        cls.frontal3d = np.column_stack([points, depth]).astype(np.float64)
+        angle = np.radians(25.0)
+        dx, dz = cls.frontal3d[:, 0] - cls.center_x, cls.frontal3d[:, 2]
+        turned_x = cls.center_x + dx * np.cos(angle) + dz * np.sin(angle)
+        turned_z = -dx * np.sin(angle) + dz * np.cos(angle)
+        cls.turned3d = np.column_stack([turned_x, cls.frontal3d[:, 1], turned_z])
+
+    def test_head_turn_is_recovered_from_the_landmarks(self):
+        pose = ha._relative_pose(self.turned3d, self.frontal3d)
+        self.assertAlmostEqual(abs(pose.yaw), 25.0, delta=1.0)
+        self.assertAlmostEqual(pose.scale, 1.0, delta=0.02)
+        np.testing.assert_allclose(pose.to_reference(self.frontal3d), self.turned3d, atol=0.5)
+
+    def test_landmarks_without_depth_skip_the_pose_correction(self):
+        width, height = self.size
+        flat = (self.points / np.array([width, height])).tolist()
+        self.assertIsNone(ha._landmark_points3d(flat, width, height))
+        with_depth = [{"x": x / width, "y": y / height, "z": z / width} for x, y, z in self.frontal3d]
+        np.testing.assert_allclose(ha._landmark_points3d(with_depth, width, height), self.frontal3d, atol=1e-6)
+
+    def test_hidden_side_gets_the_visible_side_mirrored(self):
+        width, height = self.size
+        frame = ha._face_frame(self.points)
+        skull = ha._estimate_skull(frame, self.points, self.segmentation)
+        layer = np.zeros((height, width, 4), dtype=np.float32)
+        u = skull.center_u + 0.45 * skull.face_width
+        x, y = frame.to_image(np.array([u, skull.center_v - 0.3 * skull.face_width], dtype=np.float32)).astype(int)
+        layer[y - 6 : y + 6, x - 6 : x + 6] = 1.0
+        middle = frame.to_image(np.array([skull.center_u, skull.center_v], dtype=np.float32)).astype(int)
+        layer[middle[1] - 4 : middle[1] + 4, middle[0] - 4 : middle[0] + 4] = 0.5
+
+        mirrored = ha._mirror_hidden_side(layer, self.points, skull, far_sign=-1.0)
+        opposite = np.array([2 * skull.center_u - u, skull.center_v - 0.3 * skull.face_width], dtype=np.float32)
+        mx, my = frame.to_image(opposite).astype(int)
+        self.assertGreater(float(mirrored[my, mx, 3]), 0.9)
+        self.assertGreater(float(mirrored[y, x, 3]), 0.9, "the visible side stays")
+        np.testing.assert_allclose(mirrored[middle[1], middle[0]], 0.5, atol=1e-5)
+
+
 class ThinPlateSplineTest(unittest.TestCase):
     def test_interpolates_control_points(self):
         rng = np.random.default_rng(1)

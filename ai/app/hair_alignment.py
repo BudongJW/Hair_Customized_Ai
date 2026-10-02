@@ -69,6 +69,16 @@ HEADROOM_MARGIN = 0.05
 MAX_HEADROOM_SHIFT = 0.25
 # Warped hair further than this (face widths) from the hair on the head is dropped.
 STRAY_HAIR_DISTANCE = 0.05
+# Turned hair model photos: past this relative head turn the skull correspondences come from
+# the 3D landmarks, and past MIRROR_MIN_YAW the side the turned head hides is replaced by the
+# visible side (blending the two would leave a ghost of the misplaced hidden-side hair).
+POSE_CORRECTION_MIN_YAW = 10.0
+MIRROR_MIN_YAW = 15.0
+# Landmarks that move little with expression, for the 3D pose fit.
+RIGID_LANDMARK_INDICES = [
+    10, 151, 9, 8, 168, 6, 197, 195, 5, 4, 1, 33, 133, 362, 263, 70, 300, 105, 334,
+    234, 454, 127, 356, 93, 323, 21, 251, 54, 284, 103, 332, 109, 338,
+]
 METADATA_VERSION = "hair-transfer-v3-skull-tps"
 
 
@@ -88,6 +98,7 @@ class HairLayer:
     skin_texture: np.ndarray | None = None  # fine skin detail relative to local skin brightness
     skin_texture_valid: np.ndarray | None = None
     ear_alpha: np.ndarray | None = None
+    points3d: np.ndarray | None = None  # landmarks with MediaPipe depth, in reference pixels
 
 
 @dataclass(frozen=True)
@@ -170,7 +181,10 @@ def transfer_hair(
     width, height = target.size
     target_points = _landmark_pixels(target_landmarks, width, height)
     target_skull = _estimate_skull(_face_frame(target_points), target_points, target_segmentation)
-    headroom_rows = required_headroom(layer, target_points, target_skull, (width, height)) if headroom else 0
+    headroom_rows = 0
+    if headroom:
+        target_points3d = _landmark_points3d(target_landmarks, width, height)
+        headroom_rows = required_headroom(layer, target_points, target_skull, (width, height), target_points3d)
     if headroom_rows:
         target, target_landmarks = add_headroom(target, target_landmarks, headroom_rows, target_segmentation.hair > 0.3)
         target_segmentation = _shift_segmentation(target_segmentation, headroom_rows)
@@ -179,7 +193,10 @@ def transfer_hair(
 
     bald = remove_hair(target, target_landmarks, segmentation=target_segmentation, inpainter=inpainter)
     target_frame = _face_frame(target_points)
-    warped_rgb, warped_alpha, warp = align_hair_layer(layer, target_points, target_skull, (width, height))
+    target_points3d = _landmark_points3d(target_landmarks, width, height)
+    warped_rgb, warped_alpha, warp = align_hair_layer(
+        layer, target_points, target_skull, (width, height), target_points3d=target_points3d
+    )
     warped_alpha, stray_pixels = _drop_stray_hair(warped_alpha, target_skull)
 
     canvas = np.asarray(bald.image, dtype=np.float32)
@@ -231,7 +248,13 @@ def transfer_hair(
     )
 
 
-def required_headroom(layer: HairLayer, target_points: np.ndarray, target_skull: _Skull, size: tuple[int, int]) -> int:
+def required_headroom(
+    layer: HairLayer,
+    target_points: np.ndarray,
+    target_skull: _Skull,
+    size: tuple[int, int],
+    target_points3d: np.ndarray | None = None,
+) -> int:
     """Rows of backdrop the user photo lacks above the head for the new hairstyle.
 
     ID photos are framed tight: a taller style than the user's own would be cut off by the
@@ -244,7 +267,8 @@ def required_headroom(layer: HairLayer, target_points: np.ndarray, target_skull:
     forehead_y = float(target_points[FOREHEAD_TOP_INDEX, 1])
     canvas_height = int(probe + max(forehead_y, 1.0))  # nothing of interest below the forehead
     lowered = target_points + np.array([0.0, probe], dtype=np.float32)
-    _rgb, alpha, _warp = align_hair_layer(layer, lowered, target_skull, (width, canvas_height))
+    lowered3d = None if target_points3d is None else target_points3d + np.array([0.0, probe, 0.0])
+    _rgb, alpha, _warp = align_hair_layer(layer, lowered, target_skull, (width, canvas_height), target_points3d=lowered3d)
     hair_rows = np.nonzero((alpha > 0.5).sum(axis=1) > max(3, 0.01 * width))[0]
     if not len(hair_rows):
         return 0
@@ -284,9 +308,13 @@ def add_headroom(
 
     points = _landmark_pixels(landmarks, width, height)
     points[:, 1] += rows
-    moved_landmarks = [
-        {"index": index, "x": float(x / width), "y": float(y / height)} for index, (x, y) in enumerate(points)
-    ]
+    depth = _landmark_points3d(landmarks, width, height)
+    moved_landmarks = []
+    for index, (x, y) in enumerate(points):
+        point = {"index": index, "x": float(x / width), "y": float(y / height)}
+        if depth is not None:
+            point["z"] = float(depth[index, 2] / width)  # depth is in units of the width, unchanged by the shift
+        moved_landmarks.append(point)
     return Image.fromarray(np.clip(shifted + 0.5, 0, 255).astype(np.uint8), "RGB"), moved_landmarks
 
 
@@ -363,6 +391,7 @@ def extract_hair_layer(
         skin_texture=texture,
         skin_texture_valid=texture_valid,
         ear_alpha=_ear_matte(points, frame, grid, segmentation, alpha, unit),
+        points3d=_landmark_points3d(reference_landmarks, width, height),
     )
 
 
@@ -379,15 +408,38 @@ def align_hair_layer(
     target_points: np.ndarray,
     target_skull: _Skull,
     size: tuple[int, int],
+    target_points3d: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, _Warp]:
     """Warp the hair layer so the reference skull and hairline land on the target's.
 
     Returns the warped straight RGB, its alpha, and the warp itself so other reference
     content (skin, ears) can be carried over the same way.
+
+    When the hair model's head is turned, the skull outline estimated from their (narrow,
+    foreshortened) face is in the wrong place. With MediaPipe depth for both faces, the
+    user's skull outline is instead carried into the hair model's photo through the 3D
+    head pose, and the side the turn hides is filled from the visible side.
     """
 
     source_controls = _control_points(layer.points, layer.skull)
     target_controls = _control_points(target_points, target_skull)
+    pose = _relative_pose(layer.points3d, target_points3d)
+    pose_info = None
+    far_sign = 0.0
+    if pose is not None and abs(pose.yaw) >= POSE_CORRECTION_MIN_YAW:
+        # The outline of a frontal head is its widest section, about as deep as the face edge.
+        depth = float(target_points3d[[LEFT_FACE_EDGE_INDEX, RIGHT_FACE_EDGE_INDEX], 2].mean())
+        curve = target_controls[-SKULL_CURVE_SAMPLES:]
+        lifted = np.column_stack([curve, np.full(len(curve), depth)])
+        in_reference = pose.to_reference(lifted)
+        source_controls[-SKULL_CURVE_SAMPLES:] = in_reference[:, :2]
+        # The end of the outline that turned away from the camera is the hidden side.
+        far_sign = 1.0 if in_reference[-1, 2] > in_reference[0, 2] else -1.0
+        pose_info = {
+            "yawDegrees": round(pose.yaw, 1),
+            "scale": round(pose.scale, 3),
+            "hiddenSide": "right" if far_sign > 0 else "left",
+        }
 
     unit = target_skull.face_width
     origin = target_points[FOREHEAD_TOP_INDEX]
@@ -412,6 +464,9 @@ def align_hair_layer(
     full = _sample_bilinear(coarse, pixel_xs / WARP_GRID_STEP, pixel_ys / WARP_GRID_STEP)
     premultiplied = np.dstack([layer.rgb * layer.alpha[..., None], layer.alpha])
     sampled = _sample_bilinear(premultiplied, full[..., 0], full[..., 1])
+    if far_sign and abs(pose.yaw) >= MIRROR_MIN_YAW:
+        sampled = _mirror_hidden_side(sampled, target_points, target_skull, far_sign)
+        pose_info["mirroredHiddenSide"] = True
     alpha = np.clip(sampled[..., 3], 0.0, 1.0)
     rgb = sampled[..., :3] / np.maximum(alpha, 1e-4)[..., None]
 
@@ -421,8 +476,72 @@ def align_hair_layer(
         "controlPointCount": int(len(target_controls)),
         "scale": float(target_skull.face_width / max(layer.skull.face_width, 1e-6)),
         "affineResidualPixels": float(np.sqrt((residual**2).sum(axis=1)).mean()),
+        **({"pose": pose_info} if pose_info else {}),
     }
     return np.clip(rgb, 0.0, 255.0), alpha, _Warp(source_x=full[..., 0], source_y=full[..., 1], info=info)
+
+
+@dataclass(frozen=True)
+class _Pose:
+    """Similarity transform taking reference 3D landmarks onto the target's: t = s R r + o."""
+
+    scale: float
+    rotation: np.ndarray
+    offset: np.ndarray
+    yaw: float  # degrees the hair model's head is turned relative to the user's
+
+    def to_reference(self, points: np.ndarray) -> np.ndarray:
+        return ((points - self.offset) @ self.rotation) / self.scale
+
+
+def _landmark_points3d(
+    landmarks: Sequence[dict] | Sequence[Sequence[float]] | np.ndarray, width: int, height: int
+) -> np.ndarray | None:
+    """Landmarks with MediaPipe depth (same scale as x) in pixels, or None without depth."""
+
+    if len(landmarks) and isinstance(landmarks[0], dict):
+        if any("z" not in point for point in landmarks):
+            return None
+        values = np.array([[float(p["x"]), float(p["y"]), float(p["z"])] for p in landmarks], dtype=np.float64)
+    else:
+        values = np.asarray(landmarks, dtype=np.float64)
+        if values.ndim != 2 or values.shape[1] < 3:
+            return None
+        values = values[:, :3]
+    return values * np.array([width, height, width], dtype=np.float64)
+
+
+def _relative_pose(reference3d: np.ndarray | None, target3d: np.ndarray | None) -> _Pose | None:
+    if reference3d is None or target3d is None:
+        return None
+    source, destination = reference3d[RIGID_LANDMARK_INDICES], target3d[RIGID_LANDMARK_INDICES]
+    source_center, destination_center = source.mean(axis=0), destination.mean(axis=0)
+    covariance = (source - source_center).T @ (destination - destination_center)
+    u, singular, vt = np.linalg.svd(covariance)
+    sign = np.diag([1.0, 1.0, np.sign(np.linalg.det(vt.T @ u.T))])
+    rotation = vt.T @ sign @ u.T
+    spread = float(((source - source_center) ** 2).sum())
+    if spread <= 0:
+        return None
+    scale = float((singular * np.diag(sign)).sum() / spread)
+    offset = destination_center - scale * rotation @ source_center
+    yaw = float(np.degrees(np.arctan2(rotation[0, 2], rotation[0, 0])))
+    return _Pose(scale=scale, rotation=rotation, offset=offset, yaw=yaw)
+
+
+def _mirror_hidden_side(premultiplied: np.ndarray, target_points: np.ndarray, skull: _Skull, far_sign: float) -> np.ndarray:
+    """A turned hair model shows one side of their hair and hides the other; hairstyles are
+    close to symmetric, so the hidden side gets the visible side mirrored across the face.
+    The middle (bangs, parting) keeps what the photo shows."""
+
+    height, width = premultiplied.shape[:2]
+    frame = _face_frame(target_points)
+    grid = _local_grid(frame, width, height)
+    mirrored = frame.to_image(np.stack([2.0 * skull.center_u - grid[..., 0], grid[..., 1]], axis=-1))
+    flipped = _sample_bilinear(premultiplied, mirrored[..., 0], mirrored[..., 1])
+    side = (grid[..., 0] - skull.center_u) * far_sign / skull.face_width
+    ramp = _smoothstep(0.12, 0.3, side)[..., None]
+    return premultiplied * (1.0 - ramp) + flipped * ramp
 
 
 def _control_points(points: np.ndarray, skull: _Skull) -> np.ndarray:
