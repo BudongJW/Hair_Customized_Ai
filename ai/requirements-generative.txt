@@ -1,0 +1,10 @@
+# Optional: generative touch-up (AI_GENERATIVE_REFINE=fast|quality, app/generative_refine.py).
+# pip installs the CPU build of torch; for an NVIDIA GPU install torch from
+# https://pytorch.org/get-started/locally/ first (e.g. --index-url https://download.pytorch.org/whl/cu128).
+-r requirements.txt
+torch>=2.4
+diffusers==0.40.0
+transformers==5.18.0
+accelerate==1.15.0
+peft==0.21.2
+safetensors==0.8.0

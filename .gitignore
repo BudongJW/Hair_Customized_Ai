@@ -51,6 +51,8 @@ ai/.venv/
 ai/.cache/
 ai/models/*.task
 ai/models/*.tflite
+ai/models/*.onnx
+ai/out/
 frontend/node_modules/
 frontend/.expo/
 

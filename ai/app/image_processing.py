@@ -8,7 +8,10 @@ from math import cos, radians, sin, sqrt
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageOps
 
 from .face_landmarker import MediaPipeFaceAnalysis, analyze_with_mediapipe
-from .hair_segmenter import HairSegmentationResult, segment_hair_with_mediapipe
+try:
+    from .hair_segmenter import HairSegmentationResult, segment_hair_with_mediapipe
+except ImportError:  # hair_segmenter.py is not committed yet; see hair_segmenter_fallback.py
+    from .hair_segmenter_fallback import HairSegmentationResult, segment_hair_with_mediapipe
 
 PORTRAIT_SIZE = (900, 1125)
 

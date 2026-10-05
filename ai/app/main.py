@@ -6,18 +6,28 @@ from fastapi import FastAPI
 
 from .backend_client import BackendClient
 from .config import get_settings
-from .hair_transfer import (
-    SCHEMA_VERSION,
-    PreparedHairTransfer,
-    compose_texture_hair_transfer,
-    prepare_hair_transfer,
-    with_reference_hair_artifacts,
-)
+from .demo import router as demo_router
+from .hair_alignment import METADATA_VERSION as SKULL_PIPELINE_VERSION
 from .image_processing import analyze_face_image, compose_hair_fitting, landmarks_json
 from .s3_storage import S3Storage
 from .schemas import FaceProfileJobRequest, HairFittingJobRequest, JobResponse
+from .skull_fitting import run_skull_transfer
+
+try:
+    from .hair_transfer import (
+        SCHEMA_VERSION,
+        PreparedHairTransfer,
+        compose_texture_hair_transfer,
+        prepare_hair_transfer,
+        with_reference_hair_artifacts,
+    )
+except ImportError:
+    # hair_transfer.py is not committed yet. The worker still starts; the texture and
+    # prepare modes fail with a clear message, skull and legacy modes work.
+    prepare_hair_transfer = None
 
 app = FastAPI(title="Hair Customized AI Worker")
+app.include_router(demo_router)
 
 
 @app.get("/health")
@@ -83,7 +93,16 @@ def generate_hair_fitting(request: HairFittingJobRequest) -> JobResponse:
         face_key = profile["originalImageObjectKey"]
         face_bytes = storage.download_bytes(face_key)
         reference_bytes = storage.download_bytes(job["referenceImageObjectKey"])
+        if settings.fitting_mode == "skull":
+            return _complete_skull_fitting_job(
+                request.fitting_job_id, job, face_bytes, reference_bytes, settings, backend, storage
+            )
         if settings.fitting_mode in {"prepare", "texture"}:
+            if prepare_hair_transfer is None:
+                raise RuntimeError(
+                    f"AI_FITTING_MODE={settings.fitting_mode} needs app/hair_transfer.py, which is not in "
+                    "this checkout. Use AI_FITTING_MODE=skull or legacy."
+                )
             prepared = prepare_hair_transfer(
                 face_bytes,
                 reference_bytes,
@@ -303,6 +322,62 @@ def _complete_texture_fitting_job(
                 "referenceGeometry": prepared.metadata.get("referenceGeometry", {}),
                 "referenceLandmarks": prepared.metadata.get("referenceLandmarks", []),
                 "segmentation": (prepared.metadata.get("segmentation") or {}).get("reference", {}),
+            }, ensure_ascii=False),
+            "failureReason": None,
+        })
+        hair_design_id = design["id"]
+
+    backend.update_fitting_job(job_id, {
+        "status": "COMPLETED",
+        "resultImageObjectKey": keys["result.png"],
+        "hairMaskObjectKey": keys["warped-hair-mask.png"],
+        "hairLayerObjectKey": keys["warped-hair-layer.png"],
+        "targetHairMaskObjectKey": keys["target-hair-mask.png"],
+        "inpaintingMaskObjectKey": keys["edit-mask.png"],
+        "faceProtectionMaskObjectKey": keys["face-protection-mask.png"],
+        "pipelineManifestObjectKey": manifest_key,
+        "hairDesignId": hair_design_id,
+        "failureReason": None,
+    })
+    return JobResponse(accepted=True, aggregate_id=job_id, status="COMPLETED")
+
+
+def _complete_skull_fitting_job(job_id, job, face_bytes, reference_bytes, settings, backend, storage) -> JobResponse:
+    result = run_skull_transfer(face_bytes, reference_bytes, settings)
+    prefix = f"ai/fitting-jobs/{job_id}"
+    keys = {}
+    for filename, (content_type, data) in result.artifacts().items():
+        keys[filename] = storage.upload_bytes(f"{prefix}/{filename}", data, content_type)
+
+    manifest = {
+        "stage": "COMPLETED",
+        "jobId": job_id,
+        "skullTransfer": result.metadata,
+        "artifacts": keys,
+        "sourceObjects": {
+            "profileId": job["profileId"],
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+        },
+    }
+    manifest_key = storage.upload_bytes(
+        f"{prefix}/skull-transfer.json",
+        json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+        "application/json",
+    )
+
+    hair_design_id = job.get("hairDesignId")
+    if not hair_design_id:
+        design = backend.upsert_hair_design({
+            "userId": job["userId"],
+            "sourceFittingJobId": job_id,
+            "status": "COMPLETED",
+            "referenceImageObjectKey": job["referenceImageObjectKey"],
+            "hairMaskObjectKey": keys["hair-mask.png"],
+            "hairLayerObjectKey": keys["hair-layer.png"],
+            "previewImageObjectKey": keys["hair-layer.png"],
+            "metadataJson": json.dumps({
+                "pipeline": SKULL_PIPELINE_VERSION,
+                "warnings": result.metadata.get("warnings", []),
             }, ensure_ascii=False),
             "failureReason": None,
         })
